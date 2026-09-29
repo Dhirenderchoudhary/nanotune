@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -15,8 +16,9 @@ import { useKeyInput } from "../components/index.js";
 import { getFusedModelDir } from "../lib/config.js";
 import { loadTrainingData } from "../lib/data.js";
 import { PROVIDER_TEMPLATES } from "../lib/judge-templates.js";
-import { CleanCommand } from "./clean.js";
+import { CleanCommand, validateCleanTarget } from "./clean.js";
 import { ChatCommand, streamPreview } from "./chat.js";
+import { BenchmarkCommand } from "./benchmark.js";
 import { DataExportCommand } from "./data/export.js";
 import { DataImportCommand } from "./data/import.js";
 import { DataListCommand } from "./data/list.js";
@@ -87,6 +89,20 @@ function writeIncompleteFusedModel() {
   writeFileSync(join(fusedDir, "config.json"), "{}");
 }
 
+// The real base-model cache lives under os.homedir(), not the project
+// directory, so it can't be sandboxed with process.chdir like everything
+// else here. CleanCommand accepts a baseModelCacheDir override for exactly
+// this — production never passes it, tests point it at a throwaway dir.
+const FAKE_BASE_CACHE_DIR = join(TEST_DIR, ".fake-base-cache");
+
+function writeBaseModelCache() {
+  mkdirSync(FAKE_BASE_CACHE_DIR, { recursive: true });
+  writeFileSync(
+    join(FAKE_BASE_CACHE_DIR, "org--model-q4_k_m.gguf"),
+    "x".repeat(1024),
+  );
+}
+
 function writeEvalExamples(lines: object[]) {
   writeFileSync(
     join(DATA_DIR, "valid.jsonl"),
@@ -106,6 +122,18 @@ function example(userInput: string) {
       { role: "system", content: "You are helpful." },
       { role: "user", content: userInput },
       { role: "assistant", content: `reply to ${userInput}` },
+    ],
+  };
+}
+
+function multiTurnExample(...turns: { user: string; assistant: string }[]) {
+  return {
+    messages: [
+      { role: "system", content: "You are helpful." },
+      ...turns.flatMap((t) => [
+        { role: "user", content: t.user },
+        { role: "assistant", content: t.assistant },
+      ]),
     ],
   };
 }
@@ -365,6 +393,9 @@ test.serial("CleanCommand without yes waits for confirmation before deleting", a
     t.true(output.includes("Remove it?"));
     t.false(output.includes("Removed fused model cache"));
     t.true(existsSync(fusedDir));
+    // Pinned wording: the single-cache confirm screen must read exactly as
+    // it did before --target existed, not "Fused model cache is kept...".
+    t.true(output.includes("This is kept to speed up repeat exports via --skip-fuse."));
   } finally {
     teardown();
   }
@@ -465,6 +496,144 @@ test.serial("CleanCommand leaves the cache in place on Escape", async (t) => {
     t.true(existsSync(fusedDir));
   } finally {
     process.stdin.isTTY = originalIsTTY;
+    teardown();
+  }
+});
+
+// ── clean: --target ─────────────────────────────────────────────────
+
+test("validateCleanTarget defaults to fused when --target is omitted", (t) => {
+  t.deepEqual(validateCleanTarget(undefined), { target: "fused" });
+});
+
+test("validateCleanTarget accepts fused, base, and all", (t) => {
+  t.deepEqual(validateCleanTarget("fused"), { target: "fused" });
+  t.deepEqual(validateCleanTarget("base"), { target: "base" });
+  t.deepEqual(validateCleanTarget("all"), { target: "all" });
+});
+
+test("validateCleanTarget rejects an unknown target", (t) => {
+  const result = validateCleanTarget("bogus");
+  t.true("error" in result);
+  if ("error" in result) {
+    t.true(result.error.includes("bogus"));
+    t.true(result.error.includes("fused, base, all"));
+  }
+});
+
+test.serial("CleanCommand rejects an invalid --target", async (t) => {
+  try {
+    setupProject();
+    const output = await renderCommand(
+      <CleanCommand options={{ target: "bogus" }} />,
+      "Invalid target",
+    );
+    t.true(output.includes("Invalid target: bogus"));
+  } finally {
+    teardown();
+  }
+});
+
+test.serial("CleanCommand --target base reports nothing to clean when the base cache is absent", async (t) => {
+  try {
+    setupEmptyDir(); // No project at all — --target base needs none.
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    const output = await renderCommand(
+      <CleanCommand
+        options={{ target: "base" }}
+        baseModelCacheDir={FAKE_BASE_CACHE_DIR}
+      />,
+      "Nothing to clean",
+    );
+    t.true(output.includes("Nothing to clean"));
+    t.false(output.includes("Not a Nanotune project"));
+  } finally {
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    teardown();
+  }
+});
+
+test.serial("CleanCommand --target base --yes reports nothing to clean when the base cache is absent", async (t) => {
+  // Regression check: --yes must not skip past the "is there anything to
+  // clean" check straight into doClean with an empty entries list.
+  try {
+    setupEmptyDir();
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    const output = await renderCommand(
+      <CleanCommand
+        options={{ target: "base", yes: true }}
+        baseModelCacheDir={FAKE_BASE_CACHE_DIR}
+      />,
+      "Nothing to clean",
+    );
+    t.true(output.includes("Nothing to clean"));
+    t.false(output.includes("Removed"));
+    t.false(existsSync(FAKE_BASE_CACHE_DIR));
+  } finally {
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    teardown();
+  }
+});
+
+test.serial("CleanCommand --target base removes the base-model cache with --yes", async (t) => {
+  try {
+    setupEmptyDir();
+    writeBaseModelCache();
+    t.true(existsSync(FAKE_BASE_CACHE_DIR));
+    const output = await renderCommand(
+      <CleanCommand
+        options={{ target: "base", yes: true }}
+        baseModelCacheDir={FAKE_BASE_CACHE_DIR}
+      />,
+      "Removed base model cache",
+    );
+    t.true(output.includes("Removed base model cache"));
+    t.true(output.includes("Freed:"));
+    t.false(existsSync(FAKE_BASE_CACHE_DIR));
+  } finally {
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    teardown();
+  }
+});
+
+test.serial("CleanCommand --target all removes both caches when present", async (t) => {
+  try {
+    setupProject();
+    writeFusedModel();
+    writeBaseModelCache();
+    const fusedDir = getFusedModelDir();
+    const output = await renderCommand(
+      <CleanCommand
+        options={{ target: "all", yes: true }}
+        baseModelCacheDir={FAKE_BASE_CACHE_DIR}
+      />,
+      "Removed fused model cache and base model cache",
+    );
+    t.true(output.includes("Removed fused model cache and base model cache"));
+    t.false(existsSync(fusedDir));
+    t.false(existsSync(FAKE_BASE_CACHE_DIR));
+  } finally {
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
+    teardown();
+  }
+});
+
+test.serial("CleanCommand --target all with no project still cleans the base cache", async (t) => {
+  try {
+    setupEmptyDir(); // No project — the fused/ half of --target all is skipped, not an error.
+    writeBaseModelCache();
+    const output = await renderCommand(
+      <CleanCommand
+        options={{ target: "all", yes: true }}
+        baseModelCacheDir={FAKE_BASE_CACHE_DIR}
+      />,
+      "Removed base model cache",
+    );
+    t.false(output.includes("Not a Nanotune project"));
+    t.true(output.includes("Removed base model cache"));
+    t.false(existsSync(FAKE_BASE_CACHE_DIR));
+  } finally {
+    rmSync(FAKE_BASE_CACHE_DIR, { recursive: true, force: true });
     teardown();
   }
 });
@@ -664,6 +833,48 @@ test.serial(
       t.is(userContent(loadTrainingData(true)[0]), "valid-one");
       t.is(loadTrainingData(false).length, 1);
       t.is(loadTrainingData(true).length, 1);
+    } finally {
+      process.stdin.isTTY = originalTTY;
+      teardown();
+    }
+  },
+);
+
+test.serial(
+  "DataListCommand edits the selected turn in a multi-turn example, not the first",
+  async (t) => {
+    // Regression for #135: picking a turn other than the first used to still
+    // resolve to (and overwrite) the first turn's messages.
+    const originalTTY = process.stdin.isTTY;
+    try {
+      setupProject();
+      writeExamples([
+        multiTurnExample(
+          { user: "turn1-in", assistant: "turn1-out" },
+          { user: "turn2-in", assistant: "turn2-out" },
+        ),
+      ]);
+      process.stdin.isTTY = true;
+
+      const instance = render(<DataListCommand />);
+      await settle();
+      instance.stdin.write("e"); // enter edit mode -> turn picker (2 turns)
+      await settle();
+      instance.stdin.write(KEY.down); // move to turn 2
+      await settle();
+      instance.stdin.write(KEY.enter); // select turn 2
+      await settle();
+      instance.stdin.write(KEY.enter); // submit user input unchanged
+      await settle();
+      instance.stdin.write(KEY.enter); // submit assistant output unchanged
+      await settle();
+      instance.unmount();
+
+      const messages = loadTrainingData(false)[0].messages;
+      t.is(messages[1].content, "turn1-in");
+      t.is(messages[2].content, "turn1-out");
+      t.is(messages[3].content, "turn2-in");
+      t.is(messages[4].content, "turn2-out");
     } finally {
       process.stdin.isTTY = originalTTY;
       teardown();
@@ -1002,6 +1213,29 @@ test.serial("DataImportCommand with --eval appends to the validation set", async
   }
 });
 
+test.serial(
+  "DataImportCommand with headerless imports a literal input,output CSV row",
+  async (t) => {
+    // Regression test for #136: without --headerless this row is mistaken
+    // for a CSV header and silently dropped.
+    try {
+      setupProject();
+
+      const source = join(TEST_DIR, "in.csv");
+      writeFileSync(source, '"input","output"\n');
+
+      await renderCommand(
+        <DataImportCommand file={source} yes headerless />,
+        "Imported",
+      );
+
+      t.deepEqual(loadTrainingData().map((r) => userContent(r)), ["input"]);
+    } finally {
+      teardown();
+    }
+  },
+);
+
 // ── chat startup failures ───────────────────────────────────────────
 
 /**
@@ -1067,6 +1301,51 @@ test.serial("ChatCommand reports a model path that does not exist", async (t) =>
     teardown();
   }
 });
+
+// ── benchmark command: empty dataset is rejected (#163) ───────────────
+
+const BENCH_DIR = join(NANOTUNE_DIR, "benchmarks");
+
+test.serial(
+  "BenchmarkCommand rejects an empty tests.json with the new error message",
+  async (t) => {
+    // Regression for #163: an empty tests.json used to fall through to the
+    // summary and produce passRate: 0/0 = NaN, which JSON.stringify silently
+    // serialised as null and every downstream consumer then read as a 0%
+    // regression. It must now error before any model is loaded, with a
+    // message naming the file so the user knows where to look.
+    try {
+      setupProject();
+      mkdirSync(BENCH_DIR, { recursive: true });
+      writeFileSync(join(BENCH_DIR, "tests.json"), "[]");
+
+      const output = await renderCommand(
+        <BenchmarkCommand options={{}} />,
+        "Benchmark dataset is empty",
+      );
+
+      t.true(
+        output.includes("Benchmark dataset is empty"),
+        "should name the dataset as the problem",
+      );
+      t.true(
+        output.includes("tests.json"),
+        "should point the user at the offending file",
+      );
+
+      // Defensive: the previous bug also wrote a result file with
+      // passRate: null, so guard against the broken behaviour returning.
+      const benchEntries = readdirSync(BENCH_DIR).filter((name) =>
+        name.startsWith("benchmark-"),
+      );
+      t.is(benchEntries.length, 0, "must not write a benchmark result file");
+
+      process.exitCode = 0;
+    } finally {
+      teardown();
+    }
+  },
+);
 
 // ── judge test: the states it reaches without a live judge ──────────
 
@@ -1166,12 +1445,21 @@ async function answer(instance: Rendered, prompt: string, value = "") {
   for (let i = 0; i < 30 && !instance.lastFrame()?.includes(prompt); i++) {
     await settle();
   }
+  // A freshly mounted field can drop the first key it receives, so give it a
+  // moment to attach before typing.
+  await settle();
   // Type the value if provided
   if (value) {
     await write(instance, value);
   }
-  // Submit with ENTER
-  await write(instance, ENTER);
+  // Submit with ENTER, and again if the field ignored it: an ENTER on a field
+  // that has not attached yet is lost, and the next answer would then be typed
+  // into this field instead.
+  for (let i = 0; i < 20; i++) {
+    await write(instance, ENTER);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (!instance.lastFrame()?.includes(prompt)) break;
+  }
 }
 
 async function selectProvider(instance: Rendered, id: string) {
@@ -1206,10 +1494,12 @@ test.serial("JudgeConfigureCommand walks the user through the form inside a proj
       await withTTY(async () => {
         const instance = render(<JudgeConfigureCommand />);
         await settle();
-        // Select Ollama (first option)
-        await selectProvider(instance, "ollama");
-        await answer(instance, "Provider name"); // Accept default
+        // Custom Provider: its fields start empty. The Ollama template
+        // pre-fills Base URL, so typing over it appends to the default.
+        await selectProvider(instance, "custom");
+        await answer(instance, "Provider name", "test-provider");
         await answer(instance, "Base URL", judge.url);
+        await answer(instance, "API Key", "sk-test");
         await answer(instance, "Model name", "test-model");
         // Confirm
         await settle();
@@ -1249,7 +1539,10 @@ test.serial("JudgeConfigureCommand masks the API key on the summary", async (t) 
         // Wait for the configuration summary
         await waitFor(instance, "Configuration Summary");
         await waitFor(instance, "Save and test connection");
-        const summary = instance.frames.join("\n");
+        // Only the summary frame: the key is legitimately visible in the
+        // input while it is being typed.
+        const summary = instance.lastFrame() ?? "";
+        t.true(summary.includes("Configuration Summary"));
         t.false(summary.includes("sk-test-full-key-12345"), "must not show the full key");
         t.true(summary.includes("***"), "must show a masked version");
         instance.unmount();
