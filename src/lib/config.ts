@@ -458,20 +458,32 @@ function writeProjectGitignore(): void {
 		return;
 	}
 
-	const existing = readFileSync(gitignorePath, 'utf-8');
+	let existing = readFileSync(gitignorePath, 'utf-8');
 	const present = new Set(existing.split('\n').map(line => line.trim()));
 	const missing = GITIGNORE_CONTENTS.split('\n')
 		.map(line => line.trim())
 		.filter(line => line && !present.has(line));
-	if (missing.length === 0) {
-		return;
+
+	let modified = false;
+
+	if (missing.includes('judge.json*') && present.has('judge.json')) {
+		existing = existing
+			.split('\n')
+			.map(line => (line.trim() === 'judge.json' ? 'judge.json*' : line))
+			.join('\n');
+		missing.splice(missing.indexOf('judge.json*'), 1);
+		modified = true;
 	}
 
-	const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
-	writeFileSync(
-		gitignorePath,
-		`${existing}${separator}${missing.join('\n')}\n`,
-	);
+	if (missing.length > 0) {
+		const separator = existing === '' || existing.endsWith('\n') ? '' : '\n';
+		existing = `${existing}${separator}${missing.join('\n')}\n`;
+		modified = true;
+	}
+
+	if (modified) {
+		writeFileSync(gitignorePath, existing);
+	}
 }
 
 export function initializeProjectDirs(): void {

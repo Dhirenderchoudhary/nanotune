@@ -1476,14 +1476,19 @@ async function write(instance: Rendered, text: string) {
 }
 
 test.serial("JudgeConfigureCommand renders its error state with no project", async (t) => {
-  const output = await withTTY(async () => {
-    const instance = render(<JudgeConfigureCommand />);
-    await waitFor(instance, "Not a Nanotune project");
-    const out = instance.frames.join("\n");
-    instance.unmount();
-    return out;
-  });
-  t.true(output.includes("Not a Nanotune project"));
+  try {
+    setupEmptyDir();
+    const output = await withTTY(async () => {
+      const instance = render(<JudgeConfigureCommand />);
+      await waitFor(instance, "Not a Nanotune project");
+      const out = instance.frames.join("\n");
+      instance.unmount();
+      return out;
+    });
+    t.true(output.includes("Not a Nanotune project"));
+  } finally {
+    teardown();
+  }
 });
 
 test.serial("JudgeConfigureCommand walks the user through the form inside a project", async (t) => {
@@ -1656,16 +1661,30 @@ test.serial("JudgeConfigureCommand reports a connection failure as a connection 
 });
 
 test.serial("JudgeConfigureCommand reports a failed save as a save failure", async (t) => {
-  const judge = await startStubJudge(chatCompletion);
   try {
-    setupEmptyDir(); // No .nanotune/ directory
-    await withTTY(async () => {
-      const instance = render(<JudgeConfigureCommand />);
-      await waitFor(instance, "Not a Nanotune project");
-      instance.unmount();
-    });
-    t.false(existsSync(join(NANOTUNE_DIR, "judge.json")), "must not write to a missing directory");
+    setupProject();
+    const judge = await startStubJudge(chatCompletion);
+    mkdirSync(join(NANOTUNE_DIR, "judge.json")); // Force EISDIR on save
+    try {
+      await withTTY(async () => {
+        const instance = render(<JudgeConfigureCommand />);
+        await settle();
+        await selectProvider(instance, "custom");
+        await answer(instance, "Provider name", "test-provider");
+        await answer(instance, "Base URL", judge.url);
+        await answer(instance, "API Key", "sk-test");
+        await answer(instance, "Model name", "test-model");
+        await settle();
+        await write(instance, "y");
+        await waitFor(instance, "Failed to save judge config", 10000);
+        const output = instance.frames.join("\n");
+        t.true(output.includes("Failed to save judge config"));
+        instance.unmount();
+      });
+    } finally {
+      judge.close();
+    }
   } finally {
-    judge.close();
+    teardown();
   }
 });
