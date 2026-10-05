@@ -134,6 +134,48 @@ test("validateTests rejects an empty messages array", (t) => {
   t.true(error?.message.includes("#2"));
 });
 
+test("validateTests rejects an empty acceptable answer", (t) => {
+  const error = t.throws(() =>
+    validateTests([
+      { id: 3, prompt: "list files", acceptable: ["ls -la", ""], category: "basic" },
+    ]),
+  );
+
+  t.true(error?.message.includes("#3"));
+  t.true(error?.message.includes("empty string"));
+});
+
+test("validateTests rejects a whitespace-only acceptable answer", (t) => {
+  const error = t.throws(() =>
+    validateTests([
+      { id: 4, prompt: "pwd", acceptable: ["   "], category: "nav" },
+    ]),
+  );
+
+  t.true(error?.message.includes("#4"));
+  t.true(error?.message.includes("empty string"));
+});
+
+test("validateTests reports the first bad test's id", (t) => {
+  const error = t.throws(() =>
+    validateTests([
+      { id: 5, prompt: "ok", category: "basic" },
+      { id: 6, prompt: "bad", acceptable: [""], category: "basic" },
+      { id: 7, prompt: "later", acceptable: [""], category: "basic" },
+    ]),
+  );
+
+  t.true(error?.message.includes("#6"));
+});
+
+test("validateTests accepts tests with no acceptable array", (t) => {
+  t.notThrows(() =>
+    validateTests([
+      { id: 8, prompt: "anything", category: "basic" },
+    ]),
+  );
+});
+
 // ── summarizeResults ──────────────────────────────────────────────────
 
 function result(over: Partial<BenchmarkTestResult> = {}): BenchmarkTestResult {

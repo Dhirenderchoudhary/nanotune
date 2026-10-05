@@ -185,6 +185,11 @@ export function validateTests(tests: BenchmarkTest[]): void {
 				`Test #${test.id} must have either "prompt" or "messages".`,
 			);
 		}
+		if (test.acceptable?.some(answer => answer.trim() === '')) {
+			throw new Error(
+				`Test #${test.id}: "acceptable" contains an empty string.`,
+			);
+		}
 	}
 }
 
