@@ -201,6 +201,85 @@ test.serial(
 );
 
 test.serial(
+  "a failed save stays on the failure and can be retried",
+  async (t) => {
+    const original = process.stdin.isTTY;
+    const trainPath = join(DATA_DIR, "train.jsonl");
+    try {
+      setupProject();
+      writeRun("benchmark-run.json", {
+        failures: [
+          { id: 1, prompt: "list files", expected: ["ls"], actual: "dir" },
+        ],
+      });
+      // A directory at the dataset path makes appendTrainingExample fail
+      // without relying on platform-specific permission behavior.
+      mkdirSync(trainPath);
+      process.stdin.isTTY = true;
+
+      const instance = render(<BenchmarkReviewCommand />);
+      const output = () => instance.frames.join("\n");
+      await waitFor(output, "Failure 1/1");
+      await settle();
+      instance.stdin.write("ls");
+      await settle();
+      instance.stdin.write("\r");
+      await waitFor(output, "Could not save:");
+
+      t.true(output().includes("Failure 1/1"), output());
+      t.true(output().includes("Press Enter to retry"), output());
+      t.false(output().includes("Reviewed 1/1"), output());
+
+      rmSync(trainPath, { recursive: true, force: true });
+      instance.stdin.write("\r");
+      await waitFor(output, "Reviewed 1/1");
+      instance.unmount();
+
+      const data = loadTrainingData();
+      t.is(data.length, 1, output());
+      t.is(data[0].messages.at(-1)?.content, "ls");
+    } finally {
+      process.stdin.isTTY = original;
+      teardown();
+    }
+  },
+);
+
+test.serial(
+  "stopping after a failed save keeps the error in the final summary",
+  async (t) => {
+    const original = process.stdin.isTTY;
+    try {
+      setupProject();
+      writeRun("benchmark-run.json", {
+        failures: [
+          { id: 1, prompt: "list files", expected: ["ls"], actual: "dir" },
+        ],
+      });
+      mkdirSync(join(DATA_DIR, "train.jsonl"));
+      process.stdin.isTTY = true;
+
+      const instance = render(<BenchmarkReviewCommand />);
+      const output = () => instance.frames.join("\n");
+      await waitFor(output, "Failure 1/1");
+      await settle();
+      instance.stdin.write("ls");
+      await settle();
+      instance.stdin.write("\r");
+      await waitFor(output, "Could not save:");
+
+      instance.stdin.write("\u001b");
+      await waitFor(output, "Reviewed 0/1");
+      t.true(output().includes("Could not save:"), output());
+      instance.unmount();
+    } finally {
+      process.stdin.isTTY = original;
+      teardown();
+    }
+  },
+);
+
+test.serial(
   "an empty submission skips without writing, and the final tally reports it",
   async (t) => {
     const original = process.stdin.isTTY;

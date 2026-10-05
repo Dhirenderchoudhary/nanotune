@@ -41,7 +41,10 @@ export function BenchmarkReviewCommand({report}: Props) {
 	const [index, setIndex] = useState(0);
 	const [savedCount, setSavedCount] = useState(0);
 	const [skippedCount, setSkippedCount] = useState(0);
-	const [lastMessage, setLastMessage] = useState<string | null>(null);
+	const [lastMessage, setLastMessage] = useState<{
+		type: 'success' | 'error';
+		text: string;
+	} | null>(null);
 
 	useAutoExit(status === 'done' || status === 'error', status === 'error');
 
@@ -138,13 +141,29 @@ export function BenchmarkReviewCommand({report}: Props) {
 					false,
 				);
 			}
-			setSavedCount(c => c + 1);
-			setLastMessage(`Saved (${countExamples()} examples total).`);
 		} catch (err) {
-			setLastMessage(
-				`Could not save: ${err instanceof Error ? err.message : 'write failed'}`,
-			);
+			setLastMessage({
+				type: 'error',
+				text: `Could not save: ${err instanceof Error ? err.message : 'write failed'}. Press Enter to retry, or Esc to stop.`,
+			});
+			return;
 		}
+
+		setSavedCount(c => c + 1);
+		let totalExamples: number | undefined;
+		try {
+			totalExamples = countExamples();
+		} catch {
+			// The example was already written; a failed count must not make it
+			// look like the save failed and invite a duplicate retry.
+		}
+		setLastMessage({
+			type: 'success',
+			text:
+				totalExamples === undefined
+					? 'Saved.'
+					: `Saved (${totalExamples} examples total).`,
+		});
 		advance();
 	};
 
@@ -183,6 +202,11 @@ export function BenchmarkReviewCommand({report}: Props) {
 						</Text>
 						, <Text dimColor>{skippedCount} skipped</Text>.
 					</Text>
+				)}
+				{lastMessage?.type === 'error' && (
+					<Box marginTop={1}>
+						<StatusMessage variant="error">{lastMessage.text}</StatusMessage>
+					</Box>
 				)}
 				<Text> </Text>
 				<ExitHint>Press any key to exit</ExitHint>
@@ -237,7 +261,9 @@ export function BenchmarkReviewCommand({report}: Props) {
 
 			{lastMessage && (
 				<Box marginBottom={1}>
-					<Text dimColor>{lastMessage}</Text>
+					<StatusMessage variant={lastMessage.type}>
+						{lastMessage.text}
+					</StatusMessage>
 				</Box>
 			)}
 
