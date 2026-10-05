@@ -133,6 +133,30 @@ test.serial("an example with no context message still validates", (t) => {
   t.true(result.valid);
 });
 
+// ── saveTrainingData ─────────────────────────────────────
+
+test.serial("saveTrainingData replaces the file without leaving a temp behind", (t) => {
+  // The dataset write goes through writeFileAtomic now, so for the first time
+  // it can leave a temp file next to train.jsonl. writeFileAtomic's own
+  // guarantees are covered in config.spec.ts; what this pins is that the data
+  // directory the user looks at is left holding the dataset and nothing else.
+  saveTrainingData([
+    { messages: [SYSTEM_CTX, { role: "user", content: "a" }, { role: "assistant", content: "A" }] },
+  ], false);
+  saveTrainingData([
+    { messages: [SYSTEM_CTX, { role: "user", content: "b" }, { role: "assistant", content: "B" }] },
+    { messages: [SYSTEM_CTX, { role: "user", content: "c" }, { role: "assistant", content: "C" }] },
+  ], false);
+
+  const data = loadTrainingData();
+  t.is(data.length, 2);
+  t.is(data[0].messages[1].content, "b");
+  t.deepEqual(
+    readdirSync(DATA_DIR).filter((f) => f.includes(".tmp")),
+    [],
+  );
+});
+
 // ── deleteExample ─────────────────────────────────────────────────────
 
 test.serial("deleteExample removes the correct example", (t) => {
@@ -875,7 +899,7 @@ test.serial("exportToCSV skips examples with missing user or assistant messages"
     ],
   };
   appendTrainingExample(noUser, false);
-  
+
   // Example with no assistant message
   const noAssistant: TrainingExample = {
     messages: [
@@ -884,7 +908,7 @@ test.serial("exportToCSV skips examples with missing user or assistant messages"
     ],
   };
   appendTrainingExample(noAssistant, false);
-  
+
   // Valid example
   appendToTrainingData({ contextMessage: SYSTEM_CTX, userInput: "good", assistantOutput: "example" }, false);
 
@@ -1718,9 +1742,9 @@ test.serial(
     const examples: TrainingExample[] = [
       { messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "world" }] },
     ];
-    
+
     saveTrainingData(examples, false);
-    
+
     // Data was written successfully
     t.is(countExamples(false), 1);
     const loaded = loadTrainingData(false);

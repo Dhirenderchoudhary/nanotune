@@ -179,6 +179,9 @@ export function saveTrainingData(
 	ensureDataDir();
 	const path = isEval ? getEvalDataPath() : getTrainDataPath();
 	const content = `${examples.map(ex => JSON.stringify(ex)).join('\n')}\n`;
+	// Temp-file-and-rename: this rewrites the user's whole dataset, so a crash,
+	// a full disk or a kill between truncate and write would otherwise leave
+	// train.jsonl short of the examples it started with.
 	writeFileAtomic(path, content);
 }
 
