@@ -11,8 +11,12 @@ import {
 } from 'node:fs';
 import {join} from 'node:path';
 import type {ChatMessage, TrainingExample} from '../types/index.js';
-import {getDataDir, writeFileAtomic} from './config.js';
-
+import {
+	getDataDir,
+	loadConfig,
+	resolveContextMessage,
+	writeFileAtomic,
+} from './config.js';
 
 function ensureDataDir(): void {
 	const dataDir = getDataDir();

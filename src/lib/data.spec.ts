@@ -142,11 +142,11 @@ test.serial("saveTrainingData replaces the file without leaving a temp behind", 
   // directory the user looks at is left holding the dataset and nothing else.
   saveTrainingData([
     { messages: [SYSTEM_CTX, { role: "user", content: "a" }, { role: "assistant", content: "A" }] },
-  ]);
+  ], false);
   saveTrainingData([
     { messages: [SYSTEM_CTX, { role: "user", content: "b" }, { role: "assistant", content: "B" }] },
     { messages: [SYSTEM_CTX, { role: "user", content: "c" }, { role: "assistant", content: "C" }] },
-  ]);
+  ], false);
 
   const data = loadTrainingData();
   t.is(data.length, 2);
@@ -899,7 +899,7 @@ test.serial("exportToCSV skips examples with missing user or assistant messages"
     ],
   };
   appendTrainingExample(noUser, false);
-  
+
   // Example with no assistant message
   const noAssistant: TrainingExample = {
     messages: [
@@ -908,7 +908,7 @@ test.serial("exportToCSV skips examples with missing user or assistant messages"
     ],
   };
   appendTrainingExample(noAssistant, false);
-  
+
   // Valid example
   appendToTrainingData({ contextMessage: SYSTEM_CTX, userInput: "good", assistantOutput: "example" }, false);
 
@@ -1742,9 +1742,9 @@ test.serial(
     const examples: TrainingExample[] = [
       { messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "world" }] },
     ];
-    
+
     saveTrainingData(examples, false);
-    
+
     // Data was written successfully
     t.is(countExamples(false), 1);
     const loaded = loadTrainingData(false);
