@@ -1,4 +1,10 @@
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {
+	copyFileSync,
+	existsSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execa, type ResultPromise} from 'execa';
@@ -28,6 +34,8 @@ export interface MLXTrainingOptions {
 	gradCheckpoint: boolean;
 	valBatches: number;
 	seed: number;
+	earlyStoppingPatience: number;
+	loadBestModelAtEnd: boolean;
 	/**
 	 * Optional AbortSignal for stopping a run early. Aborting sends SIGINT so
 	 * MLX writes its checkpoint before exiting; the generator then returns
@@ -376,6 +384,187 @@ export function buildTrainingArgs(
 	return args;
 }
 
+const ANSI = /\u001B\[[0-9;]*[A-Za-z]/g;
+
+const TRAIN_LINE =
+	/Iter\s+(\d+)(?:\s*\([^)]+\))?:\s*Train loss\s+([0-9]*\.?[0-9]+)(?:,\s*Val loss\s+([0-9]*\.?[0-9]+))?/i;
+const VAL_LINE =
+	/Iter\s+(\d+)(?:\s*\([^)]+\))?:\s*Val loss\s+([0-9]*\.?[0-9]+)/i;
+const RICH_VAL = /^\s*(\d+)\s+val\s+([0-9]*\.?[0-9]+)/i;
+const RICH_TRAIN = /^\s*(\d+)\s+([0-9]*\.?[0-9]+)\s+[▼▲]/;
+
+interface ParsedTrainingLine {
+	iteration: number;
+	trainLoss?: number;
+	valLoss?: number;
+}
+
+export function parseTrainingLogLine(raw: string): ParsedTrainingLine | null {
+	const line = raw.replace(ANSI, '');
+	const train = line.match(TRAIN_LINE);
+	if (train) {
+		return {
+			iteration: Number.parseInt(train[1], 10),
+			trainLoss: Number.parseFloat(train[2]),
+			...(train[3] !== undefined ? {valLoss: Number.parseFloat(train[3])} : {}),
+		};
+	}
+	const val = line.match(VAL_LINE) ?? line.match(RICH_VAL);
+	if (val) {
+		return {
+			iteration: Number.parseInt(val[1], 10),
+			valLoss: Number.parseFloat(val[2]),
+		};
+	}
+	const richTrain = line.match(RICH_TRAIN);
+	if (richTrain) {
+		return {
+			iteration: Number.parseInt(richTrain[1], 10),
+			trainLoss: Number.parseFloat(richTrain[2]),
+		};
+	}
+	return null;
+}
+
+export interface ValTracker {
+	bestValLoss: number;
+	bestIteration: number;
+	evalsSinceBest: number;
+	bestSavedIteration: number | null;
+	bestSavedValLoss: number | null;
+	// Val at a save step is recorded here until a later iteration proves mlx
+	// finished the step and wrote the file. The val line is printed first.
+	pendingSaveIteration: number | null;
+	pendingSaveValLoss: number | null;
+	lastValIteration: number;
+	lastValLoss: number;
+}
+
+export function commitPendingSave(
+	tracker: ValTracker | null,
+): ValTracker | null {
+	if (
+		!tracker ||
+		tracker.pendingSaveIteration == null ||
+		tracker.pendingSaveValLoss == null
+	) {
+		return tracker;
+	}
+	const iteration = tracker.pendingSaveIteration;
+	const loss = tracker.pendingSaveValLoss;
+	const cleared: ValTracker = {
+		...tracker,
+		pendingSaveIteration: null,
+		pendingSaveValLoss: null,
+	};
+	if (cleared.bestSavedValLoss != null && !(loss < cleared.bestSavedValLoss)) {
+		return cleared;
+	}
+	return {
+		...cleared,
+		bestSavedIteration: iteration,
+		bestSavedValLoss: loss,
+	};
+}
+
+export function noteValLoss(
+	tracker: ValTracker | null,
+	iteration: number,
+	valLoss: number,
+	saveEvery: number,
+): ValTracker | null {
+	const prior =
+		tracker?.pendingSaveIteration != null &&
+		tracker.pendingSaveIteration !== iteration
+			? commitPendingSave(tracker)
+			: tracker;
+
+	if (!Number.isFinite(valLoss)) {
+		if (!prior) {
+			return null;
+		}
+		return {...prior, evalsSinceBest: prior.evalsSinceBest + 1};
+	}
+
+	const improved = prior === null || valLoss < prior.bestValLoss;
+	const next: ValTracker = improved
+		? {
+				bestValLoss: valLoss,
+				bestIteration: iteration,
+				evalsSinceBest: 0,
+				bestSavedIteration: prior?.bestSavedIteration ?? null,
+				bestSavedValLoss: prior?.bestSavedValLoss ?? null,
+				pendingSaveIteration: null,
+				pendingSaveValLoss: null,
+				lastValIteration: iteration,
+				lastValLoss: valLoss,
+			}
+		: {
+				...prior,
+				evalsSinceBest: prior.evalsSinceBest + 1,
+				lastValIteration: iteration,
+				lastValLoss: valLoss,
+			};
+
+	if (saveEvery >= 1 && iteration % saveEvery === 0) {
+		return {
+			...next,
+			pendingSaveIteration: iteration,
+			pendingSaveValLoss: valLoss,
+		};
+	}
+	return next;
+}
+
+export function shouldStopEarly(
+	tracker: ValTracker | null,
+	patience: number,
+): boolean {
+	return patience > 0 && tracker !== null && tracker.evalsSinceBest >= patience;
+}
+
+export function checkpointToRestore(
+	tracker: ValTracker | null,
+	input: {
+		iterations: number;
+		earlyStop: boolean;
+		loadBest: boolean;
+		userAborted: boolean;
+	},
+): number | null {
+	if (input.userAborted || tracker?.bestSavedIteration == null) {
+		return null;
+	}
+	if (!input.earlyStop && !input.loadBest) {
+		return null;
+	}
+	if (
+		!input.earlyStop &&
+		tracker.lastValIteration === input.iterations &&
+		tracker.bestSavedValLoss != null &&
+		tracker.lastValLoss <= tracker.bestSavedValLoss
+	) {
+		return null;
+	}
+	return tracker.bestSavedIteration;
+}
+
+function checkpointFileName(iteration: number): string {
+	return `${String(iteration).padStart(7, '0')}_adapters.safetensors`;
+}
+
+export function restoreBestAdapter(
+	adapterDir: string,
+	iteration: number,
+): boolean {
+	const src = join(adapterDir, checkpointFileName(iteration));
+	if (!existsSync(src)) {
+		return false;
+	}
+	copyFileSync(src, join(adapterDir, 'adapters.safetensors'));
+	return true;
+}
+
 export async function* runTraining(
 	options: MLXTrainingOptions,
 ): AsyncGenerator<TrainingProgress> {
@@ -426,6 +615,9 @@ export async function* runTraining(
 		}
 
 		let buffer = '';
+		let tracker: ValTracker | null = null;
+		let requestedEarlyStop = false;
+		let last: TrainingProgress | null = null;
 
 		// The for-await can throw ABORT_ERR if the process exits mid-stream, which
 		// is exactly what a SIGINT stop looks like. Let the subprocess result below
@@ -433,23 +625,47 @@ export async function* runTraining(
 		try {
 			for await (const chunk of stdout) {
 				buffer += chunk.toString();
-				const lines = buffer.split('\n');
+				const lines = buffer.split(/\r\n|\n|\r/);
 				buffer = lines.pop() || '';
 
 				for (const line of lines) {
-					// Parse: "Iter 10: Train loss 1.234, Val loss 1.456"
-					// or: "Iter 10 (15.2 it/s): Train loss 1.234"
-					const match = line.match(
-						/Iter\s+(\d+)(?:\s*\([^)]+\))?:\s*Train loss\s+([\d.]+)(?:,\s*Val loss\s+([\d.]+))?/i,
-					);
-					if (match) {
-						yield {
-							iteration: Number.parseInt(match[1], 10),
-							totalIterations: options.iterations,
-							trainLoss: Number.parseFloat(match[2]),
-							valLoss: match[3] ? Number.parseFloat(match[3]) : undefined,
-						};
+					const event = parseTrainingLogLine(line);
+					if (!event) {
+						continue;
 					}
+					if (event.valLoss !== undefined) {
+						tracker = noteValLoss(
+							tracker,
+							event.iteration,
+							event.valLoss,
+							options.saveEvery,
+						);
+						if (
+							!requestedEarlyStop &&
+							!options.signal?.aborted &&
+							shouldStopEarly(tracker, options.earlyStoppingPatience)
+						) {
+							requestedEarlyStop = true;
+							abortTraining(subprocess);
+						}
+					}
+					const progress: TrainingProgress = {
+						iteration: event.iteration,
+						totalIterations: options.iterations,
+						isTrainReport: event.trainLoss !== undefined,
+					};
+					if (event.trainLoss !== undefined) {
+						progress.trainLoss = event.trainLoss;
+					} else if (last?.trainLoss !== undefined) {
+						progress.trainLoss = last.trainLoss;
+					}
+					if (event.valLoss !== undefined) {
+						progress.valLoss = event.valLoss;
+					} else if (last?.valLoss !== undefined) {
+						progress.valLoss = last.valLoss;
+					}
+					last = progress;
+					yield progress;
 				}
 			}
 		} catch (err) {
@@ -461,22 +677,48 @@ export async function* runTraining(
 		try {
 			await subprocess;
 		} catch (err) {
-			// A stop we asked for: MLX has flushed its checkpoint, so return
-			// normally instead of reporting the interrupted run as a failure.
-			if (options.signal?.aborted) {
-				return;
+			if (!options.signal?.aborted && !requestedEarlyStop) {
+				const errorMessage =
+					err instanceof Error ? err.message : 'Training failed';
+				const stderrTrimmed = stderrOutput.trim();
+				if (stderrTrimmed) {
+					const stderrLines = stderrTrimmed.split('\n');
+					const relevantLines = stderrLines.slice(-10).join('\n');
+					throw new Error(`${errorMessage}\n\nDetails:\n${relevantLines}`);
+				}
+				throw err;
 			}
-			// Include stderr in the error message for better debugging
-			const errorMessage =
-				err instanceof Error ? err.message : 'Training failed';
-			const stderrTrimmed = stderrOutput.trim();
-			if (stderrTrimmed) {
-				// Extract the most relevant part of the error (last few lines usually have the actual error)
-				const stderrLines = stderrTrimmed.split('\n');
-				const relevantLines = stderrLines.slice(-10).join('\n');
-				throw new Error(`${errorMessage}\n\nDetails:\n${relevantLines}`);
+		}
+
+		if (!requestedEarlyStop) {
+			tracker = commitPendingSave(tracker);
+		}
+		const iteration = checkpointToRestore(tracker, {
+			iterations: options.iterations,
+			earlyStop: requestedEarlyStop,
+			loadBest: options.loadBestModelAtEnd,
+			userAborted: options.signal?.aborted === true,
+		});
+		if (requestedEarlyStop || iteration != null) {
+			const restoredBest =
+				iteration != null && restoreBestAdapter(options.adapterPath, iteration);
+			if (requestedEarlyStop || restoredBest) {
+				yield {
+					iteration: last?.iteration ?? tracker?.bestIteration ?? 0,
+					totalIterations: options.iterations,
+					trainLoss: last?.trainLoss,
+					valLoss: last?.valLoss,
+					isTrainReport: false,
+					earlyStopped: requestedEarlyStop,
+					restoredBest,
+					...(restoredBest && iteration != null
+						? {
+								bestIteration: iteration,
+								bestValLoss: tracker?.bestSavedValLoss ?? undefined,
+							}
+						: {}),
+				};
 			}
-			throw err;
 		}
 	} finally {
 		detachAbort?.();

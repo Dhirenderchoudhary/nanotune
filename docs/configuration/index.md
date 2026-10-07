@@ -38,7 +38,9 @@ Nanotune's project configuration is stored in `.nanotune/config.json`. This file
     "maxSeqLength": 2048,
     "gradCheckpoint": false,
     "valBatches": 25,
-    "seed": 0
+    "seed": 0,
+    "earlyStoppingPatience": 0,
+    "loadBestModelAtEnd": false
   },
   "export": {
     "quantization": "q4_k_m",
@@ -80,6 +82,8 @@ Nanotune's project configuration is stored in `.nanotune/config.json`. This file
 | `gradCheckpoint` | boolean | false | Enable gradient checkpointing to reduce memory use |
 | `valBatches` | number | 25 | Number of validation batches |
 | `seed` | number | 0 | Random seed for mlx_lm's training run (override with `--train-seed`, not `--seed`, which seeds the train/validation split) |
+| `earlyStoppingPatience` | number | 0 | Stop after this many validation checks with no improvement. `0` disables it |
+| `loadBestModelAtEnd` | boolean | false | When the run finishes every iteration, restore the lowest-validation saved checkpoint. Skipped when the final step's validation loss is already at least as good. Early stopping restores that checkpoint either way |
 
 ### Export
 
