@@ -100,6 +100,53 @@ type Status =
 	| 'done'
 	| 'error';
 
+export function TrainingDone({progress}: {progress: TrainingProgress | null}) {
+	const unfinished = progress?.earlyStopped && !progress.restoredBest;
+	return (
+		<Box flexDirection="column">
+			<StatusMessage variant={unfinished ? 'warning' : 'success'}>
+				{progress?.earlyStopped ? 'Stopped early' : 'Training complete!'}
+			</StatusMessage>
+			<Text> </Text>
+			{progress?.earlyStopped && (
+				<Text>Validation loss stopped improving.</Text>
+			)}
+			{progress?.restoredBest &&
+				progress.bestIteration != null &&
+				progress.bestValLoss != null && (
+					<Text>
+						Restored checkpoint at iteration{' '}
+						<Text color="cyan">{progress.bestIteration}</Text> (val loss{' '}
+						<Text color="green">{progress.bestValLoss.toFixed(4)}</Text>)
+					</Text>
+				)}
+			{unfinished && (
+				<Text>
+					No checkpoint was saved yet, so the adapter was left unchanged.
+				</Text>
+			)}
+			{!progress?.restoredBest &&
+				!progress?.earlyStopped &&
+				progress?.trainLoss != null && (
+					<Text>
+						Final loss:{' '}
+						<Text color="green">{progress.trainLoss.toFixed(4)}</Text>
+					</Text>
+				)}
+			{!unfinished && (
+				<>
+					<Text> </Text>
+					<Text>
+						Next: <Text color="cyan">nanotune export</Text>
+					</Text>
+				</>
+			)}
+			<Text> </Text>
+			<ExitHint>Press any key to exit</ExitHint>
+		</Box>
+	);
+}
+
 export function TrainCommand({options}: Props) {
 	const {exit} = useApp();
 	const [status, setStatus] = useState<Status>('checking');
@@ -565,55 +612,7 @@ export function TrainCommand({options}: Props) {
 				</Box>
 			)}
 
-			{status === 'done' && (
-				<Box flexDirection="column">
-					<StatusMessage
-						variant={
-							progress?.earlyStopped && !progress.restoredBest
-								? 'warning'
-								: 'success'
-						}
-					>
-						{progress?.earlyStopped ? 'Stopped early' : 'Training complete!'}
-					</StatusMessage>
-					<Text> </Text>
-					{progress?.earlyStopped && (
-						<Text>Validation loss stopped improving.</Text>
-					)}
-					{progress?.restoredBest &&
-						progress.bestIteration != null &&
-						progress.bestValLoss != null && (
-							<Text>
-								Restored checkpoint at iteration{' '}
-								<Text color="cyan">{progress.bestIteration}</Text> (val loss{' '}
-								<Text color="green">{progress.bestValLoss.toFixed(4)}</Text>)
-							</Text>
-						)}
-					{progress?.earlyStopped && !progress.restoredBest && (
-						<Text>
-							No checkpoint was saved yet, so the adapter was left unchanged.
-						</Text>
-					)}
-					{!progress?.restoredBest &&
-						!progress?.earlyStopped &&
-						progress?.trainLoss != null && (
-							<Text>
-								Final loss:{' '}
-								<Text color="green">{progress.trainLoss.toFixed(4)}</Text>
-							</Text>
-						)}
-					{!(progress?.earlyStopped && !progress.restoredBest) && (
-						<>
-							<Text> </Text>
-							<Text>
-								Next: <Text color="cyan">nanotune export</Text>
-							</Text>
-						</>
-					)}
-					<Text> </Text>
-					<ExitHint>Press any key to exit</ExitHint>
-				</Box>
-			)}
+			{status === 'done' && <TrainingDone progress={progress} />}
 
 			{status === 'error' && (
 				<Box flexDirection="column">
