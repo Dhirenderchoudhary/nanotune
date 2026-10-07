@@ -5,6 +5,7 @@ import {render as inkRender} from 'ink';
 import type {ReactElement} from 'react';
 import type {BenchmarkRunOptions} from './lib/benchmark-run.js';
 import {getBenchmarksDir, sweepStaleAtomicWrites} from './lib/config.js';
+import {getTrainingRunsDir} from './lib/training-runs.js';
 import {interactiveRequiredMessage, supportsRawMode} from './lib/tty.js';
 
 const pkg = JSON.parse(
@@ -396,10 +397,47 @@ program
 		render(<StatusCommand />);
 	});
 
+// Training-run history
+program
+	.command('runs')
+	.description('Show saved training runs and loss summaries')
+	.option('--limit <count>', 'Maximum number of recent runs to show', '10')
+	.option('--json', 'Print run records, including loss histories, as JSON')
+	.action(async (options: {limit: string; json?: boolean}) => {
+		const limit = Number(options.limit);
+		if (!Number.isSafeInteger(limit) || limit < 1) {
+			console.error('--limit must be a positive integer.');
+			process.exitCode = 1;
+			return;
+		}
+
+		const collect = async () => {
+			const {loadConfig} = await import('./lib/config.js');
+			const {listTrainingRuns} = await import('./lib/training-runs.js');
+			loadConfig();
+			return listTrainingRuns().slice(0, limit);
+		};
+
+		if (options.json) {
+			const {emitJson} = await import('./lib/json-output.js');
+			await emitJson(collect);
+			return;
+		}
+
+		try {
+			const {formatTrainingRuns} = await import('./lib/training-runs.js');
+			console.log(formatTrainingRuns(await collect()));
+		} catch (err) {
+			console.error(err instanceof Error ? err.message : String(err));
+			process.exitCode = 1;
+		}
+	});
+
 // Reap `.tmp-<pid>` leftovers from a previous run that was killed mid-write
 // before its own cleanup could run. Cheap (no-op when the directory doesn't
 // exist) and keeps a crashed `benchmark` from accumulating garbage forever.
 sweepStaleAtomicWrites(getBenchmarksDir());
+sweepStaleAtomicWrites(getTrainingRunsDir());
 
 // Clean command
 program

@@ -1,5 +1,6 @@
-import {existsSync} from 'node:fs';
-import {join} from 'node:path';
+import {randomUUID} from 'node:crypto';
+import {existsSync, statSync} from 'node:fs';
+import {join, relative} from 'node:path';
 import {Spinner, StatusMessage} from '@inkjs/ui';
 import {Box, Text, useApp} from 'ink';
 import {useCallback, useEffect, useRef, useState} from 'react';
@@ -28,7 +29,12 @@ import {
 	shouldTreatAsStop,
 } from '../lib/mlx.js';
 import {assertSupportedPlatform} from '../lib/platform.js';
-import {TrainingConfigSchema, type TrainingProgress} from '../types/index.js';
+import {saveTrainingRun} from '../lib/training-runs.js';
+import {
+	type TrainingConfig,
+	TrainingConfigSchema,
+	type TrainingProgress,
+} from '../types/index.js';
 
 // Maps TrainingConfigSchema field names to the CLI flag that overrides them,
 // so schema validation errors can point at the flag the user actually typed.
@@ -117,6 +123,17 @@ export function TrainCommand({options}: Props) {
 	// than re-reading config.training.saveEvery and naming the wrong iteration.
 	const [saveEvery, setSaveEvery] = useState<number | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
+	const runHistoryRef = useRef<{
+		id: string;
+		startedAt: Date;
+		baseModel: string;
+		training: TrainingConfig;
+		adapterMtimeBefore: number | null;
+		examples: {train: number; validation: number};
+		lossHistory: TrainingProgress[];
+		status: 'completed' | 'stopped' | 'failed';
+		error?: string;
+	} | null>(null);
 
 	// Ctrl+C is ours to handle here (the command renders with
 	// `exitOnCtrlC: false`), so mid-training it stops the trainer gracefully
@@ -288,6 +305,19 @@ export function TrainCommand({options}: Props) {
 			if (seed !== undefined && !split.didSplit) {
 				setSeedIgnored(true);
 			}
+			const adapterFile = join(getAdaptersDir(), 'adapters.safetensors');
+			runHistoryRef.current = {
+				id: randomUUID(),
+				startedAt: new Date(),
+				baseModel: config.baseModel,
+				training,
+				adapterMtimeBefore: existsSync(adapterFile)
+					? statSync(adapterFile).mtimeMs
+					: null,
+				examples: {train: split.trainCount, validation: split.validCount},
+				lossHistory: [],
+				status: 'failed',
+			};
 
 			// Download model if not cached
 			setStatus('downloading');
@@ -336,6 +366,7 @@ export function TrainCommand({options}: Props) {
 			for await (const update of runTraining(trainingOptions)) {
 				setProgress(update);
 				setLossHistory(prev => [...prev, update.trainLoss]);
+				runHistoryRef.current?.lossHistory.push(update);
 
 				// Calculate ETA
 				const elapsedMs = Date.now() - startTime;
@@ -351,14 +382,72 @@ export function TrainCommand({options}: Props) {
 				}
 			}
 
-			setStatus(controller.signal.aborted ? 'stopped' : 'done');
+			const stopped = controller.signal.aborted;
+			if (runHistoryRef.current) {
+				runHistoryRef.current.status = stopped ? 'stopped' : 'completed';
+			}
+			setStatus(stopped ? 'stopped' : 'done');
 		} catch (err) {
 			if (shouldTreatAsStop(abortRef.current?.signal)) {
+				if (runHistoryRef.current) {
+					runHistoryRef.current.status = 'stopped';
+				}
 				setStatus('stopped');
 				return;
 			}
-			setError(err instanceof Error ? err.message : 'Training failed');
+			const message = err instanceof Error ? err.message : 'Training failed';
+			if (runHistoryRef.current) {
+				runHistoryRef.current.status = 'failed';
+				runHistoryRef.current.error = message;
+			}
+			setError(message);
 			setStatus('error');
+		} finally {
+			const run = runHistoryRef.current;
+			if (run) {
+				const adapterFile = join(getAdaptersDir(), 'adapters.safetensors');
+				try {
+					const adapterStat = existsSync(adapterFile)
+						? statSync(adapterFile)
+						: null;
+					const adapterChanged =
+						adapterStat !== null &&
+						(run.adapterMtimeBefore === null ||
+							adapterStat.mtimeMs > run.adapterMtimeBefore);
+					saveTrainingRun({
+						id: run.id,
+						startedAt: run.startedAt.toISOString(),
+						finishedAt: new Date().toISOString(),
+						status: run.status,
+						baseModel: run.baseModel,
+						training: run.training,
+						examples: run.examples,
+						durationMs: Date.now() - run.startedAt.getTime(),
+						lossHistory: run.lossHistory.map(
+							({iteration, trainLoss, valLoss}) => ({
+								iteration,
+								trainLoss,
+								...(valLoss === undefined ? {} : {valLoss}),
+							}),
+						),
+						finalTrainLoss: run.lossHistory.at(-1)?.trainLoss ?? null,
+						finalValLoss: run.lossHistory.at(-1)?.valLoss ?? null,
+						resume: Boolean(options.resume),
+						adapterPath: relative(process.cwd(), adapterFile),
+						adapterModifiedAt:
+							adapterChanged && adapterStat
+								? adapterStat.mtime.toISOString()
+								: null,
+						...(run.error ? {error: run.error} : {}),
+					});
+				} catch (err) {
+					const message =
+						err instanceof Error ? err.message : 'Unknown file-system error';
+					setError(`Could not save training run history: ${message}`);
+					setStatus('error');
+				}
+				runHistoryRef.current = null;
+			}
 		}
 	}, [
 		options.iterations,

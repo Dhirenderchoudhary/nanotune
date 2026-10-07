@@ -437,6 +437,7 @@ const GITIGNORE_CONTENTS = `# Nanotune project artifacts
 adapters/
 models/
 benchmarks/
+runs/
 chats/
 judge.json*
 `;
