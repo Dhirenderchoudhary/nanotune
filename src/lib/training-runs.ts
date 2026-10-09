@@ -1,20 +1,28 @@
-import {existsSync, mkdirSync, readdirSync, readFileSync} from 'node:fs';
-import {join} from 'node:path';
+import {randomUUID} from 'node:crypto';
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+} from 'node:fs';
+import {join, relative} from 'node:path';
 import {z} from 'zod';
-import {TrainingConfigSchema} from '../types/index.js';
+import {type TrainingConfig, TrainingConfigSchema} from '../types/index.js';
 import {
 	getProjectDir,
 	initializeProjectDirs,
 	writeFileAtomic,
 } from './config.js';
+import type {TrainingLossPoint} from './mlx.js';
 
 const RUNS_DIR = 'runs';
 
 export const TrainingRunRecordSchema = z.object({
 	id: z.string().uuid(),
 	startedAt: z.string().datetime(),
-	finishedAt: z.string().datetime(),
-	status: z.enum(['completed', 'stopped', 'failed']),
+	finishedAt: z.string().datetime().nullable(),
+	status: z.enum(['running', 'completed', 'stopped', 'failed']),
 	baseModel: z.string(),
 	training: TrainingConfigSchema,
 	examples: z.object({
@@ -25,7 +33,7 @@ export const TrainingRunRecordSchema = z.object({
 	lossHistory: z.array(
 		z.object({
 			iteration: z.number().int().nonnegative(),
-			trainLoss: z.number().finite(),
+			trainLoss: z.number().finite().optional(),
 			valLoss: z.number().finite().optional(),
 		}),
 	),
@@ -35,9 +43,75 @@ export const TrainingRunRecordSchema = z.object({
 	adapterPath: z.string(),
 	adapterModifiedAt: z.string().datetime().nullable(),
 	error: z.string().optional(),
+	resumedFromRunId: z.string().uuid().nullable().optional(),
 });
 
 export type TrainingRunRecord = z.infer<typeof TrainingRunRecordSchema>;
+
+/** Save before expensive work, then refresh on loss reports and finalization. */
+export function startTrainingRun(options: {
+	baseModel: string;
+	training: TrainingConfig;
+	examples: {train: number; validation: number};
+	adapterFile: string;
+	resume: boolean;
+}) {
+	const startedAt = new Date();
+	const initialAdapter = existsSync(options.adapterFile)
+		? statSync(options.adapterFile)
+		: null;
+	const before = initialAdapter?.mtimeMs ?? null;
+	const previous =
+		options.resume && before !== null
+			? listTrainingRuns().find(
+					run => run.adapterModifiedAt === initialAdapter?.mtime.toISOString(),
+				)
+			: undefined;
+	const record: TrainingRunRecord = {
+		id: randomUUID(),
+		startedAt: startedAt.toISOString(),
+		finishedAt: null,
+		status: 'running',
+		baseModel: options.baseModel,
+		training: options.training,
+		examples: options.examples,
+		durationMs: 0,
+		lossHistory: [],
+		finalTrainLoss: null,
+		finalValLoss: null,
+		resume: options.resume,
+		resumedFromRunId: previous?.id ?? null,
+		adapterPath: relative(process.cwd(), options.adapterFile),
+		adapterModifiedAt: null,
+	};
+	function persist() {
+		record.durationMs = Math.max(0, Date.now() - startedAt.getTime());
+		const adapter = existsSync(options.adapterFile)
+			? statSync(options.adapterFile)
+			: null;
+		if (adapter && (before === null || adapter.mtimeMs !== before)) {
+			record.adapterModifiedAt = adapter.mtime.toISOString();
+		}
+		saveTrainingRun(record);
+	}
+	persist();
+	return {
+		checkpoint: persist,
+		update(point: TrainingLossPoint) {
+			record.lossHistory.push(point);
+			if (point.trainLoss !== undefined)
+				record.finalTrainLoss = point.trainLoss;
+			if (point.valLoss !== undefined) record.finalValLoss = point.valLoss;
+			persist();
+		},
+		finish(status: 'completed' | 'stopped' | 'failed', error?: string) {
+			record.status = status;
+			record.finishedAt = new Date().toISOString();
+			if (error) record.error = error;
+			persist();
+		},
+	};
+}
 
 export function getTrainingRunsDir(): string {
 	return join(getProjectDir(), RUNS_DIR);
@@ -103,6 +177,7 @@ export function formatTrainingRuns(runs: TrainingRunRecord[]): string {
 				run.status,
 				run.baseModel,
 				`${run.training.iterations} iterations`,
+				`lr ${run.training.learningRate}, batch ${run.training.batchSize}, ${run.training.fineTuneType}, rank ${run.training.loraRank}, alpha ${run.training.loraAlpha}`,
 				`${run.examples.train} train / ${run.examples.validation} validation`,
 				`${Math.round(run.durationMs / 1000)}s`,
 				losses,

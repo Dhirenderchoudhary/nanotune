@@ -58,6 +58,7 @@ export interface StatusReport {
 		adapterRun: Pick<
 			TrainingRunRecord,
 			| 'baseModel'
+			| 'status'
 			| 'training'
 			| 'examples'
 			| 'durationMs'
@@ -90,15 +91,12 @@ export function collectStatus(): StatusReport {
 	const lastRun = mtimeIso(join(getAdaptersDir(), 'adapters.safetensors'));
 	const runs = listTrainingRuns();
 	const matchingAdapterRun = lastRun
-		? (runs.find(
-				run =>
-					(run.status === 'completed' || run.status === 'stopped') &&
-					run.adapterModifiedAt === lastRun,
-			) ?? null)
+		? (runs.find(run => run.adapterModifiedAt === lastRun) ?? null)
 		: null;
 	const adapterRun = matchingAdapterRun
 		? {
 				baseModel: matchingAdapterRun.baseModel,
+				status: matchingAdapterRun.status,
 				training: matchingAdapterRun.training,
 				examples: matchingAdapterRun.examples,
 				durationMs: matchingAdapterRun.durationMs,

@@ -34,6 +34,34 @@ export interface MLXTrainingOptions {
 	 * normally, since a user-requested stop is not a training failure.
 	 */
 	signal?: AbortSignal;
+	/** All loss reports, including standalone validation evaluations. */
+	onLoss?: (point: TrainingLossPoint) => void;
+	/** Called once MLX reports a checkpoint write has completed. */
+	onCheckpoint?: () => void;
+}
+
+export interface TrainingLossPoint {
+	iteration: number;
+	trainLoss?: number;
+	valLoss?: number;
+}
+
+/** MLX reports train and validation losses on separate lines. */
+export function parseTrainingLoss(line: string): TrainingLossPoint | null {
+	const prefix = line.match(
+		/Iter\s+(\d+)(?:\s*\([^)]+\))?:\s*(?:Train|Val) loss/i,
+	);
+	if (!prefix) return null;
+	const number = '([+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?)';
+	const train = line.match(new RegExp(`Train loss\\s+${number}`, 'i'));
+	const val = line.match(new RegExp(`Val loss\\s+${number}`, 'i'));
+	const point: TrainingLossPoint = {iteration: Number(prefix[1])};
+	if (train && Number.isFinite(Number(train[1])))
+		point.trainLoss = Number(train[1]);
+	if (val && Number.isFinite(Number(val[1]))) point.valLoss = Number(val[1]);
+	return point.trainLoss === undefined && point.valLoss === undefined
+		? null
+		: point;
 }
 
 // mlx_lm has no flat CLI flags for LoRA rank/scale/dropout. They are only
@@ -384,6 +412,8 @@ export async function* runTraining(
 	// gets cleaned up in the finally below rather than leaking a temp dir.
 	let loraConfigDir: string | null = null;
 	let detachAbort: (() => void) | null = null;
+	let subprocess: ResultPromise | undefined;
+	let subprocessSettled = false;
 	try {
 		let loraConfigPath: string | undefined;
 		if (needsLoraConfig(options.fineTuneType)) {
@@ -399,15 +429,11 @@ export async function* runTraining(
 			);
 		}
 
-		const subprocess = execa(
-			'python3',
-			buildTrainingArgs(options, loraConfigPath),
-			{
-				stdout: 'pipe',
-				stderr: 'pipe',
-				buffer: false,
-			},
-		);
+		subprocess = execa('python3', buildTrainingArgs(options, loraConfigPath), {
+			stdout: 'pipe',
+			stderr: 'pipe',
+			buffer: false,
+		});
 
 		detachAbort = stopOnAbort(subprocess, options.signal);
 
@@ -426,6 +452,23 @@ export async function* runTraining(
 		}
 
 		let buffer = '';
+		let latestValLoss: number | undefined;
+		function parseUpdate(line: string): TrainingProgress | null {
+			if (/Saved (?:adapter|final) weights/i.test(line))
+				options.onCheckpoint?.();
+			const point = parseTrainingLoss(line);
+			if (!point) return null;
+			options.onLoss?.(point);
+			if (point.valLoss !== undefined) latestValLoss = point.valLoss;
+			return point.trainLoss === undefined
+				? null
+				: {
+						iteration: point.iteration,
+						totalIterations: options.iterations,
+						trainLoss: point.trainLoss,
+						valLoss: latestValLoss,
+					};
+		}
 
 		// The for-await can throw ABORT_ERR if the process exits mid-stream, which
 		// is exactly what a SIGINT stop looks like. Let the subprocess result below
@@ -437,19 +480,8 @@ export async function* runTraining(
 				buffer = lines.pop() || '';
 
 				for (const line of lines) {
-					// Parse: "Iter 10: Train loss 1.234, Val loss 1.456"
-					// or: "Iter 10 (15.2 it/s): Train loss 1.234"
-					const match = line.match(
-						/Iter\s+(\d+)(?:\s*\([^)]+\))?:\s*Train loss\s+([\d.]+)(?:,\s*Val loss\s+([\d.]+))?/i,
-					);
-					if (match) {
-						yield {
-							iteration: Number.parseInt(match[1], 10),
-							totalIterations: options.iterations,
-							trainLoss: Number.parseFloat(match[2]),
-							valLoss: match[3] ? Number.parseFloat(match[3]) : undefined,
-						};
-					}
+					const update = parseUpdate(line);
+					if (update) yield update;
 				}
 			}
 		} catch (err) {
@@ -458,9 +490,13 @@ export async function* runTraining(
 			}
 		}
 
+		const finalUpdate = parseUpdate(buffer);
+		if (finalUpdate) yield finalUpdate;
 		try {
 			await subprocess;
+			subprocessSettled = true;
 		} catch (err) {
+			subprocessSettled = true;
 			// A stop we asked for: MLX has flushed its checkpoint, so return
 			// normally instead of reporting the interrupted run as a failure.
 			if (options.signal?.aborted) {
@@ -480,6 +516,12 @@ export async function* runTraining(
 		}
 	} finally {
 		detachAbort?.();
+		// A failed history write or a consumer ending the generator must not
+		// leave a trainer updating weights after its run has been finalized.
+		if (subprocess && !subprocessSettled) {
+			subprocess.kill('SIGINT');
+			await subprocess.catch(() => {});
+		}
 		if (loraConfigDir) {
 			rmSync(loraConfigDir, {recursive: true, force: true});
 		}

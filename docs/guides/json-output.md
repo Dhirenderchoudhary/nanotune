@@ -107,7 +107,7 @@ nanotune status --json
 | `data.trainLastModified` | string \| null | ISO 8601 mtime of `train.jsonl`; `null` if it does not exist |
 | `training.hasTrained` | boolean | Whether an adapter checkpoint exists |
 | `training.lastRun` | string \| null | ISO 8601 mtime of `adapters.safetensors`; `null` if never trained |
-| `training.adapterRun` | object \| null | Settings, data counts, duration, and final losses for the completed or stopped run that produced the current adapter |
+| `training.adapterRun` | object \| null | Settings, outcome, data counts, duration, and latest losses for the run that produced the current adapter, including failed or still-running runs |
 | `exports[]` | array | Exported GGUFs, **newest first** — `.exports[0]` is the latest |
 | `exports[].sizeBytes` | number | File size in bytes |
 | `benchmarks.latest` | object \| null | Most recent saved run; `null` if none, or if the saved run could not be parsed |

@@ -24,6 +24,13 @@ validation loss points:
 nanotune runs --json | jq '.[0].lossHistory'
 ```
 
+Records are written before downloading/training, refreshed for loss and
+checkpoint reports, and finalized as `completed`, `stopped`, or `failed`.
+A `running` record with `finishedAt: null` may belong to a live run or one
+interrupted before it could finalize. Train and validation reports are separate
+loss points; each has an iteration and the loss values reported at that step.
+Resumed runs include `resumedFromRunId` when their source adapter has a record.
+
 ## Options
 
 | Flag | Description |

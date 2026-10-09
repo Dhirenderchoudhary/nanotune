@@ -124,6 +124,9 @@ export function StatusCommand() {
 					<Box flexDirection="column" marginTop={1}>
 						<Text bold>{'  '}Current adapter run:</Text>
 						<Text>
+							{'    '}Outcome: {report.training.adapterRun.status}
+						</Text>
+						<Text>
 							{'    '}Model: {report.training.adapterRun.baseModel}
 						</Text>
 						<Text>
