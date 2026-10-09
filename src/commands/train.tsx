@@ -28,6 +28,7 @@ import {
 	shouldTreatAsStop,
 } from '../lib/mlx.js';
 import {assertSupportedPlatform} from '../lib/platform.js';
+import {startTrainingRun} from '../lib/training-runs.js';
 import {TrainingConfigSchema, type TrainingProgress} from '../types/index.js';
 
 // Maps TrainingConfigSchema field names to the CLI flag that overrides them,
@@ -117,6 +118,9 @@ export function TrainCommand({options}: Props) {
 	// than re-reading config.training.saveEvery and naming the wrong iteration.
 	const [saveEvery, setSaveEvery] = useState<number | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
+	const runHistoryRef = useRef<ReturnType<typeof startTrainingRun> | null>(
+		null,
+	);
 
 	// Ctrl+C is ours to handle here (the command renders with
 	// `exitOnCtrlC: false`), so mid-training it stops the trainer gracefully
@@ -129,6 +133,12 @@ export function TrainCommand({options}: Props) {
 				abortRef.current?.abort();
 				setStatus('stopping');
 			} else if (status === 'stopping') {
+				try {
+					runHistoryRef.current?.finish('stopped');
+				} catch (err) {
+					setError(`Could not save training run history: ${String(err)}`);
+					return;
+				}
 				process.exit(130);
 			} else {
 				exit();
@@ -158,6 +168,8 @@ export function TrainCommand({options}: Props) {
 	}, [status]);
 
 	const run = useCallback(async () => {
+		let outcome: 'completed' | 'stopped' | 'failed' = 'failed';
+		let failure: string | undefined;
 		try {
 			// Parse the seed before any work happens. Number.parseInt would turn
 			// a typo into NaN and mulberry32 would coerce that to 0, producing a
@@ -288,6 +300,14 @@ export function TrainCommand({options}: Props) {
 			if (seed !== undefined && !split.didSplit) {
 				setSeedIgnored(true);
 			}
+			const adapterFile = join(getAdaptersDir(), 'adapters.safetensors');
+			runHistoryRef.current = startTrainingRun({
+				baseModel: config.baseModel,
+				training,
+				adapterFile,
+				examples: {train: split.trainCount, validation: split.validCount},
+				resume: Boolean(options.resume),
+			});
 
 			// Download model if not cached
 			setStatus('downloading');
@@ -331,6 +351,8 @@ export function TrainCommand({options}: Props) {
 				adapterPath: getAdaptersDir(),
 				resume: options.resume,
 				signal: controller.signal,
+				onLoss: point => runHistoryRef.current?.update(point),
+				onCheckpoint: () => runHistoryRef.current?.checkpoint(),
 			};
 
 			for await (const update of runTraining(trainingOptions)) {
@@ -351,14 +373,32 @@ export function TrainCommand({options}: Props) {
 				}
 			}
 
-			setStatus(controller.signal.aborted ? 'stopped' : 'done');
+			const stopped = controller.signal.aborted;
+			outcome = stopped ? 'stopped' : 'completed';
+			setStatus(stopped ? 'stopped' : 'done');
 		} catch (err) {
 			if (shouldTreatAsStop(abortRef.current?.signal)) {
+				outcome = 'stopped';
 				setStatus('stopped');
 				return;
 			}
-			setError(err instanceof Error ? err.message : 'Training failed');
+			const message = err instanceof Error ? err.message : 'Training failed';
+			failure = message;
+			setError(message);
 			setStatus('error');
+		} finally {
+			const run = runHistoryRef.current;
+			if (run) {
+				try {
+					run.finish(outcome, failure);
+				} catch (err) {
+					const message =
+						err instanceof Error ? err.message : 'Unknown file-system error';
+					setError(`Could not save training run history: ${message}`);
+					setStatus('error');
+				}
+				runHistoryRef.current = null;
+			}
 		}
 	}, [
 		options.iterations,
@@ -482,7 +522,7 @@ export function TrainCommand({options}: Props) {
 							Train Loss:{' '}
 							<Text color="green">{progress.trainLoss.toFixed(4)}</Text>
 						</Text>
-						{progress.valLoss && (
+						{progress.valLoss !== undefined && (
 							<Text>
 								{' | '}Val Loss:{' '}
 								<Text color="green">{progress.valLoss.toFixed(4)}</Text>
