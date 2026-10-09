@@ -299,7 +299,68 @@ test('a signal that fires mid-retry stops the loop', async t => {
 test('the default sleep resolves without hanging when nothing aborts', async t => {
 	// Guards the real timer path; the injected sleep above never exercises it.
 	const started = Date.now();
-	await retry(async () => 'ok', {baseDelayMs: 1});
+	let calls = 0;
+	const result = await retry(async () => {
+		if (++calls === 1) throw networkError('ECONNRESET');
+		return 'ok';
+	}, {baseDelayMs: 1, maxDelayMs: 1});
+	t.is(result, 'ok');
+	t.is(calls, 2);
+	t.true(Date.now() - started < 1000);
+});
+
+test('Retry-After is a floor even above the backoff ceiling', async t => {
+	const {sleep, delays} = fakeSleep();
+	let calls = 0;
+	await retry(async () => {
+		if (++calls === 1) throw new HttpError('u', 503, '', '60');
+		return 'ok';
+	}, {sleep});
+	t.deepEqual(delays, [60_000]);
+});
+
+test('Retry-After parses dates and rejects invalid numeric values', t => {
+	const future = new Date(Date.now() + 60_000).toUTCString();
+	const delay = new HttpError('u', 503, '', future).retryAfterMs;
+	t.true(delay !== undefined && delay > 58_000 && delay <= 60_000);
+	t.is(new HttpError('u', 503, '', 'Thu, 01 Jan 1970 00:00:00 GMT').retryAfterMs, 0);
+	for (const header of [' ', '-1', '1.5', 'garbage', '9'.repeat(400)]) {
+		t.is(new HttpError('u', 503, '', header).retryAfterMs, undefined);
+	}
+});
+
+test('Retry-After cannot overflow a Node timer into an immediate retry', async t => {
+	const {sleep, delays} = fakeSleep();
+	let calls = 0;
+	await retry(async () => {
+		if (++calls === 1) throw new HttpError('u', 429, '', '999999999');
+		return 'ok';
+	}, {sleep});
+	t.deepEqual(delays, [2 ** 31 - 1]);
+});
+
+test('a permissive classifier cannot retry an AbortError without a signal', async t => {
+	const {sleep, delays} = fakeSleep();
+	let calls = 0;
+	await t.throwsAsync(retry(async () => {
+		calls++;
+		throw abortError();
+	}, {sleep, isRetryable: () => true}));
+	t.is(calls, 1);
+	t.deepEqual(delays, []);
+});
+
+test('cancellation interrupts the real backoff timer', async t => {
+	const controller = new AbortController();
+	let calls = 0;
+	const started = Date.now();
+	const result = retry(async () => {
+		calls++;
+		setTimeout(() => controller.abort(), 10);
+		throw networkError('ECONNRESET');
+	}, {baseDelayMs: 30_000, signal: controller.signal});
+	await t.throwsAsync(result, {name: 'AbortError'});
+	t.is(calls, 1);
 	t.true(Date.now() - started < 1000);
 });
 

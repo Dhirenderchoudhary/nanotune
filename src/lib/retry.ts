@@ -90,14 +90,18 @@ export class HttpError extends Error {
  * degrade to the computed backoff rather than throw inside error construction.
  */
 function parseRetryAfter(header?: string | null): number | undefined {
-	if (!header) return undefined;
+	if (!header?.trim()) return undefined;
+	const value = header.trim();
 
-	const seconds = Number(header);
-	if (Number.isFinite(seconds) && seconds >= 0) {
-		return seconds * 1000;
+	if (/^\d+$/.test(value)) {
+		const ms = Number(value) * 1000;
+		return Number.isFinite(ms) ? ms : undefined;
 	}
 
-	const asDate = Date.parse(header);
+	// Avoid Date.parse interpreting an invalid numeric delay such as '-1' as
+	// a date. HTTP dates contain a month name.
+	if (!/[a-z]/i.test(value)) return undefined;
+	const asDate = Date.parse(value);
 	if (!Number.isNaN(asDate)) {
 		return Math.max(0, asDate - Date.now());
 	}
@@ -109,7 +113,7 @@ export interface RetryOptions {
 	attempts?: number;
 	/** Delay before the second attempt; doubles from there. Default 1000. */
 	baseDelayMs?: number;
-	/** Ceiling for a single wait. Default 30_000. */
+	/** Ceiling for exponential backoff. Retry-After may exceed it. Default 30_000. */
 	maxDelayMs?: number;
 	isRetryable?: (err: unknown) => boolean;
 	/** Injected so tests can assert the sequence without waiting. */
@@ -137,7 +141,7 @@ function networkCode(err: unknown): string | undefined {
 }
 
 function isRetryableStatus(status: number, hasRetryAfter: boolean): boolean {
-	if (status >= 500) return true;
+	if (status >= 500 && status < 600) return true;
 	if (RETRYABLE_STATUS.has(status)) return true;
 	// GitHub answers an unauthenticated API rate limit with 403 plus
 	// `Retry-After`, while a genuinely forbidden release asset gets a bare 403.
@@ -222,13 +226,18 @@ export async function retry<T>(
 		} catch (err) {
 			// Checked ahead of `isRetryable` so a caller that supplies a
 			// permissive classifier still cannot swallow a cancellation.
-			if (attempt === attempts || signal?.aborted || !isRetryable(err)) {
+			if (
+				attempt === attempts ||
+				signal?.aborted ||
+				isAbort(err) ||
+				!isRetryable(err)
+			) {
 				throw err;
 			}
-			await sleep(
-				computeBackoffDelay(attempt, baseDelayMs, maxDelayMs),
-				signal,
-			);
+			const backoff = computeBackoffDelay(attempt, baseDelayMs, maxDelayMs);
+			const retryAfter = err instanceof HttpError ? (err.retryAfterMs ?? 0) : 0;
+			// Node timers overflow beyond this limit and become a 1 ms wait.
+			await sleep(Math.min(Math.max(backoff, retryAfter), 2 ** 31 - 1), signal);
 		}
 	}
 

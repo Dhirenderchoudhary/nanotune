@@ -1,13 +1,12 @@
-import {createWriteStream, existsSync, mkdirSync} from 'node:fs';
+import {existsSync, mkdirSync} from 'node:fs';
 import {chmod, rm} from 'node:fs/promises';
 import {createServer} from 'node:net';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
-import {pipeline} from 'node:stream/promises';
 import {execa, type ResultPromise} from 'execa';
 import type {ChatMessage, QuantizationType} from '../types/index.js';
+import {downloadToFile, fetchJson} from './download.js';
 import {assertSupportedPlatform} from './platform.js';
-import {HttpError, retry} from './retry.js';
 
 const LLAMA_CPP_DIR = join(homedir(), '.nanotune', 'llama.cpp');
 const LLAMA_CPP_BIN_DIR = join(LLAMA_CPP_DIR, 'bin');
@@ -44,13 +43,9 @@ async function getLatestRelease(): Promise<{
 }> {
 	// A 502 from the GitHub API is usually gone within a second or two, and
 	// losing the whole install over one blip is a poor trade for a 1 s wait.
-	const response = await retry(() =>
-		fetch(GITHUB_API_LATEST, {
-			headers: {Accept: 'application/vnd.github.v3+json'},
-		}).then(checkedFetch(GITHUB_API_LATEST)),
-	);
-
-	const release = (await response.json()) as GitHubRelease;
+	const release = await fetchJson<GitHubRelease>(GITHUB_API_LATEST, {
+		headers: {Accept: 'application/vnd.github.v3+json'},
+	});
 
 	// Find the macOS arm64 binary (Apple Silicon)
 	const asset = release.assets.find(
@@ -65,49 +60,6 @@ async function getLatestRelease(): Promise<{
 		tag: release.tag_name,
 		downloadUrl: asset.browser_download_url,
 	};
-}
-
-/**
- * Turn a non-2xx response into an `HttpError` so the retry classifier can see
- * the status. `fetch` resolves on a 404, so without this every failure looks
- * alike and a missing asset gets the same three attempts as an overloaded CDN.
- */
-function checkedFetch(url: string): (response: Response) => Response {
-	return response => {
-		if (!response.ok) {
-			throw new HttpError(
-				url,
-				response.status,
-				response.statusText,
-				response.headers.get('retry-after'),
-			);
-		}
-		return response;
-	};
-}
-
-/**
- * Fetch `url` and stream the body to `destPath`, retrying the pair as a single
- * unit.
- *
- * The retry is safe because `createWriteStream` opens with the default `'w'`
- * flag, which truncates: an attempt that dies at 60% leaves a short file, and
- * the next attempt overwrites it from zero rather than appending. That is
- * load-bearing — an append flag here would produce a corrupt tarball that
- * `tar -xzf` fails on with an error pointing nowhere near the network.
- */
-async function downloadToFile(url: string, destPath: string): Promise<void> {
-	await retry(async () => {
-		const response = await fetch(url).then(checkedFetch(url));
-		if (!response.body) {
-			throw new Error(`No response body for ${url}`);
-		}
-
-		await pipeline(
-			response.body as unknown as NodeJS.ReadableStream,
-			createWriteStream(destPath),
-		);
-	});
 }
 
 async function downloadAndExtract(url: string, destDir: string): Promise<void> {
@@ -449,6 +401,13 @@ export interface ServerOptions {
 	ctxSize?: number;
 	batchSize?: number;
 	cpuOnly?: boolean;
+	/**
+	 * Name reported back by the server's own API (chat-completion responses,
+	 * `/v1/models`, `/props`) via `--alias`. Without it llama-server falls
+	 * back to the raw model path, so anything inspecting the running server
+	 * directly can't tell which model/quantization is loaded.
+	 */
+	alias?: string;
 }
 
 /** Per-request generation options (passed in the chat completions body). */
@@ -522,38 +481,23 @@ export async function waitForServerOrExit(
 }
 
 /**
- * Start a llama-server child process bound to a free local port. Caller must
- * stop it with `stopLlamaServer` (the kill is non-graceful but llama-server
- * is happy to be killed).
+ * Build the llama-server CLI args. Pulled out of `startLlamaServer` so the
+ * flag-building logic is unit-testable without spawning the real binary,
+ * which isn't available in CI.
  */
-export async function startLlamaServer(
+export function buildServerArgs(
 	modelPath: string,
+	port: number,
 	options: ServerOptions = {},
-	startupTimeoutMs = 60_000,
-): Promise<ServerHandle> {
+): string[] {
 	const {
 		threads,
 		gpuLayers,
 		ctxSize = 4096,
 		batchSize = 2048,
 		cpuOnly,
+		alias,
 	} = options;
-
-	const serverBin = join(LLAMA_CPP_BIN_DIR, 'llama-server');
-
-	// Ensure llama-server is available (may be missing from older installations)
-	if (!existsSync(serverBin)) {
-		for await (const _ of installLlamaCpp()) {
-			// consume install progress
-		}
-		if (!existsSync(serverBin)) {
-			throw new Error(
-				'llama-server binary not found after installation. Please re-run `nanotune export` to update llama.cpp.',
-			);
-		}
-	}
-
-	const port = await findFreePort();
 
 	const args: string[] = [
 		'-m',
@@ -577,6 +521,40 @@ export async function startLlamaServer(
 	if (cpuOnly) {
 		args.push('-ngl', '0');
 	}
+	if (alias) {
+		args.push('--alias', alias);
+	}
+
+	return args;
+}
+
+/**
+ * Start a llama-server child process bound to a free local port. Caller must
+ * stop it with `stopLlamaServer` (the kill is non-graceful but llama-server
+ * is happy to be killed).
+ */
+export async function startLlamaServer(
+	modelPath: string,
+	options: ServerOptions = {},
+	startupTimeoutMs = 60_000,
+): Promise<ServerHandle> {
+	const serverBin = join(LLAMA_CPP_BIN_DIR, 'llama-server');
+
+	// Ensure llama-server is available (may be missing from older installations)
+	if (!existsSync(serverBin)) {
+		for await (const _ of installLlamaCpp()) {
+			// consume install progress
+		}
+		if (!existsSync(serverBin)) {
+			throw new Error(
+				'llama-server binary not found after installation. Please re-run `nanotune export` to update llama.cpp.',
+			);
+		}
+	}
+
+	const port = await findFreePort();
+
+	const args = buildServerArgs(modelPath, port, options);
 
 	const serverProcess = execa(serverBin, args, {
 		stdin: 'ignore',
