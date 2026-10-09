@@ -15,7 +15,7 @@ import type {
 	JudgeProviderConfig,
 	JudgeResult,
 } from '../types/index.js';
-import {getProjectDir} from './config.js';
+import {getProjectDir, initializeProjectDirs} from './config.js';
 import {isUnresolvedEnvRef, substituteEnvVars} from './env-substitution.js';
 
 const JUDGE_CONFIG_FILE = 'judge.json';
@@ -68,7 +68,7 @@ export function loadJudgeConfig(): JudgeProviderConfig {
 	// missing. Letting it through means a placeholder or empty credential reaches
 	// the provider, and the 401 that comes back reads as a bad account rather than
 	// an unexported shell variable.
-	for (const [field, value] of Object.entries(config)) {
+	for (const [field, value] of Object.entries(raw)) {
 		if (isUnresolvedEnvRef(value)) {
 			throw new Error(
 				`judge.json "${field}" is set to ${value}, but that environment variable ` +
@@ -89,8 +89,13 @@ export function loadJudgeConfig(): JudgeProviderConfig {
  * present in a file that is not already 0600 — including when replacing a 0644
  * config left by 1.5.0 or earlier — and an interrupted write cannot leave a
  * truncated judge.json for `loadJudgeConfig` to choke on.
+ *
+ * `initializeProjectDirs` runs first for its .gitignore: a 0600 file is no
+ * protection at all if git is free to commit it, and projects initialised
+ * before `judge.json*` joined that list never got the entry.
  */
 export function saveJudgeConfig(config: JudgeProviderConfig): void {
+	initializeProjectDirs();
 	const path = getJudgeConfigPath();
 	const tmp = `${path}.tmp`;
 	// Clear a temp left behind by a process that died between write and

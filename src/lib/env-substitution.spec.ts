@@ -205,7 +205,41 @@ test('substituteEnvVars - a literal key survives inside a judge config', t => {
 // isUnresolvedEnvRef
 
 test('isUnresolvedEnvRef - true for a bare reference', t => {
-	t.true(isUnresolvedEnvRef('${SOME_VAR}'));
+	delete process.env.NANOTUNE_MISSING_REF;
+	t.true(isUnresolvedEnvRef('${NANOTUNE_MISSING_REF}'));
+});
+
+test('isUnresolvedEnvRef - defaults and set variables are not unresolved', t => {
+	delete process.env.NANOTUNE_MISSING_REF;
+	t.false(isUnresolvedEnvRef('${NANOTUNE_MISSING_REF:-fallback}'));
+	t.false(isUnresolvedEnvRef('${NANOTUNE_MISSING_REF:-}'));
+	process.env.NANOTUNE_SET_REF = '';
+	t.false(isUnresolvedEnvRef('${NANOTUNE_SET_REF}'));
+	delete process.env.NANOTUNE_SET_REF;
+});
+
+for (const value of [
+	'${NANOTUNE_BOUNDARY_REF}\n',
+	'${NANOTUNE_BOUNDARY_REF}\r\n',
+	' ${NANOTUNE_BOUNDARY_REF}',
+	'${NANOTUNE_BOUNDARY_REF} ',
+	'${NANOTUNE_BOUNDARY_REF:-first}${OTHER_REF}',
+	'${NANOTUNE_BOUNDARY_REF:-first}-suffix}',
+]) {
+	test(`substituteEnvVars - preserves literal boundary: ${JSON.stringify(value)}`, t => {
+		process.env.NANOTUNE_BOUNDARY_REF = 'expanded';
+		t.is(substituteEnvVars(value), value);
+		t.false(isUnresolvedEnvRef(value));
+		delete process.env.NANOTUNE_BOUNDARY_REF;
+	});
+}
+
+test('substituteEnvVars - preserves multiline defaults', t => {
+	delete process.env.NANOTUNE_MISSING_REF;
+	t.is(
+		substituteEnvVars('${NANOTUNE_MISSING_REF:-first\nsecond}'),
+		'first\nsecond',
+	);
 });
 
 test('isUnresolvedEnvRef - false for a literal key that contains a dollar', t => {

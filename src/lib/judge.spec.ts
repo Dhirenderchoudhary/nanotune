@@ -426,6 +426,41 @@ test.serial('loadJudgeConfig - a default keeps an unset variable from throwing',
 	);
 });
 
+test.serial('loadJudgeConfig - does not reinterpret an environment value as a reference', t => {
+	process.env.NANOTUNE_TEST_KEY = '${NANOTUNE_UNSET_KEY}';
+	delete process.env.NANOTUNE_UNSET_KEY;
+	try {
+		withJudgeConfig(
+			{
+				name: 'Local',
+				baseUrl: 'http://localhost/v1',
+				model: 'test-model',
+				apiKey: '${NANOTUNE_TEST_KEY}',
+			},
+			() => t.is(loadJudgeConfig().apiKey, '${NANOTUNE_UNSET_KEY}'),
+		);
+	} finally {
+		delete process.env.NANOTUNE_TEST_KEY;
+	}
+});
+
+test.serial('loadJudgeConfig - identifies an unset endpoint variable', t => {
+	delete process.env.NANOTUNE_UNSET_HOST;
+	withJudgeConfig(
+		{
+			name: 'Local',
+			baseUrl: '${NANOTUNE_UNSET_HOST}',
+			model: 'test-model',
+			apiKey: 'sk-literal',
+		},
+		() => {
+			t.throws(() => loadJudgeConfig(), {
+				message: /"baseUrl".*NANOTUNE_UNSET_HOST/,
+			});
+		},
+	);
+});
+
 // callJudge
 
 /**
@@ -434,12 +469,14 @@ test.serial('loadJudgeConfig - a default keeps an unset variable from throwing',
  * against: a server that accepts the connection and never answers, which is
  * what a hung model server or a slow rate-limit backoff looks like from here.
  */
-async function startJudgeEndpoint(respond?: (content: string) => string) {
+async function startJudgeEndpoint(
+	respond?: (content: string, authorization?: string) => string,
+) {
 	const sockets: Socket[] = [];
-	const server: Server = createServer((_req, res) => {
+	const server: Server = createServer((req, res) => {
 		if (!respond) return;
 		res.writeHead(200, {'content-type': 'application/json'});
-		res.end(respond(''));
+		res.end(respond('', req.headers.authorization));
 	});
 	server.on('connection', socket => sockets.push(socket));
 	await new Promise<void>(resolve => {
@@ -535,5 +572,109 @@ test.serial('callJudge - returns the judge verdict when the provider answers', a
 	} finally {
 		clearTimeout(timeoutId);
 		await endpoint.close();
+	}
+});
+
+for (const apiKey of ['sk-ant-api03-AB$CD-EF', '']) {
+	test.serial(`callJudge - sends the expected credential for ${apiKey || 'a local server'}`, async t => {
+		let authorization: string | undefined;
+		const endpoint = await startJudgeEndpoint((_content, header) => {
+			authorization = header;
+			return JSON.stringify({
+				id: 'chatcmpl-test',
+				object: 'chat.completion',
+				created: 0,
+				model: 'test-model',
+				choices: [
+					{
+						index: 0,
+						message: {
+							role: 'assistant',
+							content:
+								'{"scores":{"helpful":9},"overall":9,"reasoning":"Correct.","pass":true}',
+						},
+						finish_reason: 'stop',
+					},
+				],
+				usage: {prompt_tokens: 1, completion_tokens: 1, total_tokens: 2},
+			});
+		});
+		try {
+			let config: ReturnType<typeof loadJudgeConfig> = {
+				name: 'Local',
+				baseUrl: endpoint.baseUrl,
+				model: 'test-model',
+				apiKey,
+			};
+			withJudgeConfig({}, () => {
+				saveJudgeConfig(config);
+				config = loadJudgeConfig();
+				t.is(
+					JSON.parse(readFileSync(getJudgeConfigPath(), 'utf-8')).apiKey,
+					apiKey,
+				);
+			});
+			const result = await callJudge(
+				'What is 2+2?',
+				'4',
+				resolveCriteria(['helpful']),
+				config,
+				7,
+				undefined,
+				AbortSignal.timeout(5000),
+			);
+			t.true(result.pass);
+			t.is(authorization, `Bearer ${apiKey || 'dummy-key'}`);
+		} finally {
+			await endpoint.close();
+		}
+	});
+}
+
+test.serial('saveJudgeConfig - creates the project directory when it is missing', t => {
+	const originalCwd = process.cwd();
+	const dir = mkdtempSync(join(tmpdir(), 'nanotune-judge-'));
+	try {
+		process.chdir(dir);
+		// No .nanotune/ at all: the exclusive create used to fail with ENOENT
+		// after the key had already been typed and the connection tested, and
+		// the key was discarded.
+		t.notThrows(() =>
+			saveJudgeConfig({
+				name: 'Test',
+				baseUrl: 'https://example.invalid/v1',
+				apiKey: 'sk-secret',
+				model: 'test-model',
+			}),
+		);
+		t.is(JSON.parse(readFileSync(getJudgeConfigPath(), 'utf-8')).name, 'Test');
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('saveJudgeConfig - back-fills judge.json* into an existing .gitignore', t => {
+	const originalCwd = process.cwd();
+	const dir = mkdtempSync(join(tmpdir(), 'nanotune-judge-'));
+	try {
+		process.chdir(dir);
+		mkdirSync(join(dir, '.nanotune'), {recursive: true});
+		// A project initialised before judge.json joined the list. Writing the
+		// key 0600 is no protection while git is free to commit the file.
+		const gitignore = join(dir, '.nanotune', '.gitignore');
+		writeFileSync(gitignore, '# Nanotune project artifacts\nadapters/\nmodels/\n');
+
+		saveJudgeConfig({
+			name: 'Test',
+			baseUrl: 'https://example.invalid/v1',
+			apiKey: 'sk-secret',
+			model: 'test-model',
+		});
+
+		t.true(readFileSync(gitignore, 'utf-8').split('\n').includes('judge.json*'));
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(dir, {recursive: true, force: true});
 	}
 });

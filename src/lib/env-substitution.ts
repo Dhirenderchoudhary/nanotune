@@ -9,7 +9,10 @@
  * credentials, so the rule is now exact: a value either *is* a reference, or it
  * is a literal that round-trips byte for byte.
  */
-const ENV_REFERENCE = /^\$\{([A-Z_][A-Z0-9_]*)(?::-(.*))?\}$/s;
+// A default cannot consume a closing brace from another reference. The final
+// assertion requires the actual end of the value; `$` also accepts a trailing
+// newline, which would violate the literal round-trip contract.
+const ENV_REFERENCE = /^\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}(?![\s\S])/;
 
 /**
  * Expand a `${VAR}` reference, or return the string untouched.
@@ -42,7 +45,13 @@ function expandEnvVar(str: string): string {
  * the variable is unset and no default was given.
  */
 export function isUnresolvedEnvRef(value: unknown): value is string {
-	return typeof value === 'string' && ENV_REFERENCE.test(value);
+	if (typeof value !== 'string') return false;
+	const match = ENV_REFERENCE.exec(value);
+	return (
+		match !== null &&
+		match[2] === undefined &&
+		process.env[match[1]] === undefined
+	);
 }
 
 // Recursively substitute environment variables in objects, arrays, and strings

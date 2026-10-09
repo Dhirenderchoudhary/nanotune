@@ -1,8 +1,12 @@
 import {
 	appendFileSync,
+	closeSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
+	readSync,
+	statSync,
 	writeFileSync,
 } from 'node:fs';
 import {join} from 'node:path';
@@ -46,8 +50,22 @@ export function countExamples(isEval = false): number {
 
 export interface ParsedTrainingData {
 	examples: TrainingExample[];
-	/** One `Example N: invalid JSON` per unparseable line, in file order. */
+	/**
+	 * One `Example N: invalid JSON` per unparseable line, or `Example N: invalid
+	 * structure` per line that parses but isn't `{messages: [{role, content}]}`,
+	 * in file order.
+	 */
 	errors: string[];
+}
+
+function isWellFormedExample(value: unknown): value is TrainingExample {
+	const messages = (value as {messages?: unknown} | null)?.messages;
+	return (
+		Array.isArray(messages) &&
+		messages.every(
+			m => typeof m?.role === 'string' && typeof m?.content === 'string',
+		)
+	);
 }
 
 /**
@@ -69,10 +87,17 @@ export function parseTrainingData(isEval = false): ParsedTrainingData {
 	}
 	const lines = content.split('\n').filter(line => line.trim());
 	lines.forEach((line, i) => {
+		let parsed: unknown;
 		try {
-			examples.push(JSON.parse(line) as TrainingExample);
+			parsed = JSON.parse(line);
 		} catch {
 			errors.push(`Example ${i + 1}: invalid JSON`);
+			return;
+		}
+		if (isWellFormedExample(parsed)) {
+			examples.push(parsed);
+		} else {
+			errors.push(`Example ${i + 1}: invalid structure`);
 		}
 	});
 	return {examples, errors};
@@ -103,8 +128,25 @@ export function appendTrainingExample(
 ): void {
 	ensureDataDir();
 	const path = isEval ? getEvalDataPath() : getTrainDataPath();
-	const line = `${JSON.stringify(example)}\n`;
-	appendFileSync(path, line);
+	// A hand-edited file may end without a newline; appending straight onto it
+	// would glue this example to the previous line and corrupt both.
+	let prefix = '';
+	if (existsSync(path)) {
+		const {size} = statSync(path);
+		if (size > 0) {
+			const last = Buffer.alloc(1);
+			const fd = openSync(path, 'r');
+			try {
+				readSync(fd, last, 0, 1, size - 1);
+			} finally {
+				closeSync(fd);
+			}
+			if (last[0] !== 0x0a) {
+				prefix = '\n';
+			}
+		}
+	}
+	appendFileSync(path, `${prefix}${JSON.stringify(example)}\n`);
 }
 
 export function appendToTrainingData(
@@ -137,6 +179,9 @@ export function saveTrainingData(
 	ensureDataDir();
 	const path = isEval ? getEvalDataPath() : getTrainDataPath();
 	const content = `${examples.map(ex => JSON.stringify(ex)).join('\n')}\n`;
+	// Temp-file-and-rename: this rewrites the user's whole dataset, so a crash,
+	// a full disk or a kill between truncate and write would otherwise leave
+	// train.jsonl short of the examples it started with.
 	writeFileAtomic(path, content);
 }
 
@@ -341,14 +386,6 @@ export function validateTrainingData(
 
 	for (let i = 0; i < examples.length; i++) {
 		const ex = examples[i];
-
-		// Check structure
-		if (!ex.messages || !Array.isArray(ex.messages)) {
-			errors.push(
-				`Example ${i + 1}: Invalid structure - missing messages array`,
-			);
-			continue;
-		}
 
 		if (ex.messages.length < 2) {
 			errors.push(
