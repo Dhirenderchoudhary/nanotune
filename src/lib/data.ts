@@ -346,11 +346,22 @@ export interface ValidationResult {
 	 */
 	duplicateInputs: number;
 	inconsistentContextMessages: number;
+	overlongExamples: number;
+}
+
+// ponytail: chars/4, not the model tokenizer. Use the tokenizer if this misses real mlx failures.
+function estimateTokens(example: TrainingExample): number {
+	const chars = example.messages.reduce(
+		(n, message) => n + (message.content?.length ?? 0),
+		0,
+	);
+	return Math.ceil(chars / 4);
 }
 
 export function validateTrainingData(
 	contextMessage: ChatMessage,
 	isEval = false,
+	maxSeqLength = 2048,
 ): ValidationResult {
 	const warnings: string[] = [];
 	const {examples, errors} = parseTrainingData(isEval);
@@ -369,6 +380,7 @@ export function validateTrainingData(
 			warnings,
 			duplicateInputs: 0,
 			inconsistentContextMessages: 0,
+			overlongExamples: 0,
 		};
 	}
 
@@ -383,9 +395,14 @@ export function validateTrainingData(
 	const seenInputs = new Set<string>();
 	let duplicateCount = 0;
 	let inconsistentPromptCount = 0;
+	const overlong: {index: number; tokens: number}[] = [];
 
 	for (let i = 0; i < examples.length; i++) {
 		const ex = examples[i];
+		const tokens = estimateTokens(ex);
+		if (tokens > maxSeqLength) {
+			overlong.push({index: i + 1, tokens});
+		}
 
 		if (ex.messages.length < 2) {
 			errors.push(
@@ -444,12 +461,24 @@ export function validateTrainingData(
 		warnings.push(`${duplicateCount} duplicate user inputs found`);
 	}
 
+	if (overlong.length > 0) {
+		overlong.sort((a, b) => b.tokens - a.tokens || a.index - b.index);
+		const listed = overlong
+			.slice(0, 5)
+			.map(item => `example ${item.index} (~${item.tokens} tokens)`)
+			.join(', ');
+		warnings.push(
+			`${overlong.length} example${overlong.length === 1 ? '' : 's'} may be longer than maxSeqLength (${maxSeqLength}). Longest: ${listed}`,
+		);
+	}
+
 	return {
 		valid: errors.length === 0,
 		errors,
 		warnings,
 		duplicateInputs: duplicateCount,
 		inconsistentContextMessages: inconsistentPromptCount,
+		overlongExamples: overlong.length,
 	};
 }
 
@@ -550,6 +579,8 @@ export interface ValidationChecks {
 	noDuplicateInputs: boolean;
 	/** Always true for a validation set — the 50-example floor is a training-set rule. */
 	minimumExampleCount: boolean;
+	/** True when no example's character estimate exceeds training.maxSeqLength. */
+	withinMaxSeqLength: boolean;
 }
 
 /** Everything `nanotune data validate` reports, as data. */
@@ -584,7 +615,8 @@ export function collectValidation({
 	rewriteContext = false,
 	isEval = false,
 }: ValidationOptions = {}): ValidationReport {
-	const contextMessage = resolveContextMessage(loadConfig());
+	const config = loadConfig();
+	const contextMessage = resolveContextMessage(config);
 
 	// Rewrite context first: examples that only become identical after context
 	// normalization must still be caught by dedupe in this pass.
@@ -596,7 +628,11 @@ export function collectValidation({
 	// Count and validate after the fixes, so the report describes the data
 	// actually left on disk rather than the state it was in on entry.
 	const examples = countExamples(isEval);
-	const result = validateTrainingData(contextMessage, isEval);
+	const result = validateTrainingData(
+		contextMessage,
+		isEval,
+		config.training.maxSeqLength,
+	);
 
 	return {
 		set: isEval ? 'eval' : 'train',
@@ -613,6 +649,7 @@ export function collectValidation({
 			// floor does not apply to it — matching the rule `validateTrainingData`
 			// already uses when deciding whether to warn.
 			minimumExampleCount: isEval || examples >= 50,
+			withinMaxSeqLength: result.overlongExamples === 0,
 		},
 		fixes:
 			contextFix || dedupe
