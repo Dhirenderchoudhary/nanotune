@@ -1,6 +1,6 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
-import {TrainingDone} from './train.js';
+import {TrainingDone} from './TrainingDone.js';
 
 function stripAnsi(text: string): string {
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching ANSI.
@@ -32,7 +32,7 @@ test('a restored early stop names the checkpoint and offers export', t => {
 	t.true(frame.includes('Restored checkpoint at iteration 100'));
 	t.true(frame.includes('0.8000'));
 	t.true(frame.includes('nanotune export'));
-	t.false(frame.includes('left unchanged'));
+	t.false(frame.includes('last saved adapter was kept'));
 	t.false(frame.includes('Final loss'));
 });
 
@@ -44,7 +44,7 @@ test('an early stop with nothing saved does not offer export', t => {
 		trainLoss: 1.2,
 	});
 	t.true(frame.includes('Stopped early'));
-	t.true(frame.includes('left unchanged'));
+	t.true(frame.includes('last saved adapter was kept'));
 	t.false(frame.includes('nanotune export'));
 	t.false(frame.includes('Final loss'));
 });

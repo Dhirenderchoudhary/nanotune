@@ -101,7 +101,11 @@ Training runs LoRA (Low-Rank Adaptation) fine-tuning via MLX with a live progres
 
 Training checkpoints are saved at regular intervals (configurable via `saveEvery` in your config, or overridden per-run with `--save-every`). If training is interrupted, use `--resume` to continue from the last checkpoint.
 
-`earlyStoppingPatience` counts validation checks, not optimizer steps. `0` (the default) trains for the full iteration count. Once the patience is used up, training stops and the active adapter is pointed at the lowest-validation checkpoint mlx actually saved (`NNNNNNN_adapters.safetensors` copied over `adapters.safetensors`). A validation report between save intervals still counts toward patience, but only a report on a save step has a snapshot to restore. `loadBestModelAtEnd` does that same restore when the run finishes every iteration, unless the final step's validation loss is already at least as good as that checkpoint. Ctrl+C does not restore; it leaves the checkpoint you interrupted on.
+`earlyStoppingPatience` counts validation checks, not optimizer steps. `0` (the default) trains for the full iteration count. With early stopping or `loadBestModelAtEnd` enabled, Nanotune snapshots the exact weights inside MLX's validation callback whenever finite validation loss improves. Validation occurs before the next optimizer update, so its reported best iteration is the number of completed updates (the initial model is iteration `0`). Selection does not depend on `saveEvery` or numbered checkpoints from earlier runs.
+
+When patience is exhausted, MLX stops before the next update and the evaluated best snapshot atomically replaces `adapters.safetensors`. `loadBestModelAtEnd` also restores that snapshot at normal completion: the last validation evaluates weights before the final update, so the final weights are not assumed to have that same score. If no finite evaluation exists, no snapshot is selected and the last saved adapter is kept; the done screen does not offer export after such an early stop. NaN/infinite evaluations count toward patience but never become the best model. Ctrl+C skips restoration and leaves the checkpoint you interrupted on.
+
+Training history records `earlyStopped`, `restoredBest`, `bestIteration`, and `bestValLoss` alongside the loss curve and effective settings. Early-stopped runs have outcome `stopped`.
 
 ## See Also
 

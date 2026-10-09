@@ -1227,6 +1227,7 @@ test.serial("initializeProjectDirs writes the full .gitignore for a new project"
       "adapters/",
       "models/",
       "benchmarks/",
+      "runs/",
       "chats/",
       "judge.json*",
     ]);
@@ -1246,6 +1247,7 @@ test.serial("initializeProjectDirs back-fills a pre-1.4.0 .gitignore", (t) => {
     const lines = gitignoreLines();
     t.true(lines.includes("judge.json*"));
     t.true(lines.includes("benchmarks/"));
+    t.true(lines.includes("runs/"));
     t.true(lines.includes("chats/"));
     // Entries already there are neither lost nor repeated.
     t.is(lines.filter((line) => line === "adapters/").length, 1);
