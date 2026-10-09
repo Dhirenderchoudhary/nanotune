@@ -349,7 +349,7 @@ export interface ValidationResult {
 	overlongExamples: number;
 }
 
-// ponytail: chars/4, not the model tokenizer. Use the tokenizer if this misses real mlx failures.
+// chars/4, not the model tokenizer. Use the tokenizer if this misses real mlx failures.
 function estimateTokens(example: TrainingExample): number {
 	const chars = example.messages.reduce(
 		(n, message) => n + (message.content?.length ?? 0),
